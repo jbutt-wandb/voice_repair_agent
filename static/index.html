@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Repair Agent — Deepgram STT → LLM → TTS</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="title">
+      <h1>Voice Repair Agent</h1>
+      <span class="subtitle">Deepgram STT &rarr; OpenAI &rarr; Deepgram TTS, one WebSocket</span>
+    </div>
+    <div class="controls">
+      <span id="state-badge" class="badge idle">disconnected</span>
+      <button id="connect-btn">Start call</button>
+    </div>
+  </header>
+
+  <main>
+    <section id="conversation-panel">
+      <div id="transcript"></div>
+      <form id="text-form" autocomplete="off">
+        <input id="text-input" type="text"
+               placeholder="Type instead of speaking (bypasses STT — for testing)">
+        <button type="submit">Send</button>
+      </form>
+    </section>
+
+    <aside id="side-panel">
+      <div class="card">
+        <h2>Pipeline</h2>
+        <div id="pipeline">
+          <span class="stage" data-stage="mic">Mic</span><span class="arrow">&rarr;</span>
+          <span class="stage" data-stage="stt">STT</span><span class="arrow">&rarr;</span>
+          <span class="stage" data-stage="llm">LLM</span><span class="arrow">&rarr;</span>
+          <span class="stage" data-stage="tts">TTS</span><span class="arrow">&rarr;</span>
+          <span class="stage" data-stage="spk">Speaker</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Per-turn latency (ms)</h2>
+        <table id="metrics-table">
+          <thead>
+            <tr>
+              <th title="Turn number" style="width:9%">#</th>
+              <th title="Endpoint wait: silence after your last word before the STT declared the turn over">STT&nbsp;fin</th>
+              <th title="LLM time to first token">TTFT</th>
+              <th title="TTS time to first audio byte">TTFB</th>
+              <th title="You stopped speaking → first audio byte sent by server">V2V</th>
+              <th title="You stopped speaking → first audio actually playing in your browser">heard</th>
+              <th title="Was this turn interrupted (barge-in)?" style="width:8%">✂</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+          <tfoot>
+            <tr id="metrics-avg"><td>avg</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td></td></tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <div class="card hint">
+        <h2>Try it</h2>
+        <p>“My washing machine won’t drain” &rarr; safe fix.<br>
+           “My ice maker isn’t cooling” &rarr; engineer booking.<br>
+           Talk over the agent to barge in. Use headphones.</p>
+      </div>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
