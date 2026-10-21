@@ -220,7 +220,12 @@ function handleEvent(ev) {
     }
     case 'final_transcript': {
       if (interimBubble) { interimBubble.remove(); interimBubble = null; }
-      if (!userBubble) userBubble = addBubble('user');
+      // Start a fresh bubble when the turn changes (a new user utterance), so
+      // separate turns don't concatenate into one bubble.
+      if (!userBubble || userBubble.dataset.turn !== String(ev.turn_id)) {
+        userBubble = addBubble('user');
+        userBubble.dataset.turn = String(ev.turn_id);
+      }
       userBubble.textContent = (userBubble.textContent + ' ' + ev.text).trim();
       scrollDown();
       break;

@@ -2,6 +2,7 @@
 tuning a production voice agent — the README explains the tradeoff behind each."""
 
 import os
+from pathlib import Path
 
 # ---------------------------------------------------------------- speech-to-text
 STT_MODEL = "nova-3"          # Deepgram's streaming STT model
@@ -40,3 +41,8 @@ MIN_SENTENCE_CHARS = 20
 
 SERVER_HOST = os.environ.get("HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("PORT", "8000"))
+
+# ---------------------------------------------------------------- latency logging
+# Each session's per-turn + aggregate latency is written here as a timestamped JSON
+# on teardown (see server/session.py::_write_latency_log). Gitignored.
+LATENCY_LOG_DIR = Path(__file__).resolve().parent.parent / "session_logs"

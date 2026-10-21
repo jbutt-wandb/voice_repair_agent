@@ -35,10 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import enum
 import json
 import logging
 import os
+import statistics
 import time
 from dataclasses import asdict, dataclass
 
@@ -48,11 +50,22 @@ from openai import AsyncOpenAI
 from . import llm
 from .agent import build_system_prompt
 from .config import (CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
-                     MIN_SENTENCE_CHARS)
+                     LATENCY_LOG_DIR, MIN_SENTENCE_CHARS)
 from .stt import DeepgramSTT, SpeechStarted, Transcript, UtteranceEnd
 from .tts import AudioChunk, Cleared, DeepgramTTS, Flushed
 
 log = logging.getLogger("session")
+
+# Metric fields we aggregate across a session, in display order.
+_METRIC_FIELDS = ("stt_final_ms", "llm_ttft_ms", "tts_ttfb_ms",
+                  "v2v_server_ms", "v2v_client_ms")
+
+
+def _p95(values: list[float]) -> float:
+    """Nearest-rank 95th percentile (no numpy): the value at ceil(0.95*n)."""
+    ordered = sorted(values)
+    rank = max(1, -(-len(ordered) * 95 // 100))  # ceil(0.95*n)
+    return ordered[rank - 1]
 
 GREETING = ("Hi, you're through to HomeFix Appliances repair support, this is Alex. "
             "Which appliance can I help you with today?")
@@ -115,6 +128,10 @@ class Session:
         self.t_first_speak = 0.0
         self.total_barge_ins = 0
 
+        # Per-session latency record, flushed to a JSON file on teardown.
+        self.started_at = datetime.datetime.now(datetime.timezone.utc)
+        self.turn_metrics: dict[int, dict] = {}   # turn_id -> merged metric fields
+
     # ------------------------------------------------------------------ lifecycle
 
     async def run(self) -> None:
@@ -148,6 +165,12 @@ class Session:
                         await t
                 log.info("session closed (%d turns, %d barge-ins)",
                          self.turn_id, self.total_barge_ins)
+                # Flush this session's latency record. Never let a logging failure
+                # propagate out of teardown.
+                try:
+                    self._write_latency_log()
+                except Exception:
+                    log.exception("failed to write latency log")
 
     # ------------------------------------------------------------------ receive loops
 
@@ -448,7 +471,70 @@ class Session:
 
     async def _send_metrics(self) -> None:
         if self.metrics:
-            await self._send({"type": "turn_metrics", **asdict(self.metrics)})
+            payload = {"type": "turn_metrics", **asdict(self.metrics)}
+            self._record_metrics(payload)   # also accumulate for the session log
+            await self._send(payload)
+
+    def _record_metrics(self, payload: dict) -> None:
+        """Merge a turn_metrics payload's non-None metric fields into the per-session
+        record, keyed by turn_id (the same payload is also sent to the browser)."""
+        turn_id = payload.get("turn_id")
+        if turn_id is None:
+            return
+        row = self.turn_metrics.setdefault(turn_id, {})
+        for field in _METRIC_FIELDS:
+            value = payload.get(field)
+            if value is not None:
+                row[field] = value
+
+    def _write_latency_log(self) -> None:
+        """Write this session's per-turn + aggregate latency to a timestamped JSON
+        file. Called once on teardown. No-op for sessions with no recorded turns."""
+        turns = [tid for tid, m in self.turn_metrics.items() if m]
+        if not turns:
+            log.debug("no turn metrics recorded; skipping latency log")
+            return
+
+        per_turn = [{"turn_id": tid, **self.turn_metrics[tid]} for tid in sorted(turns)]
+
+        overall = {}
+        for field in _METRIC_FIELDS:
+            values = [m[field] for m in self.turn_metrics.values() if m.get(field) is not None]
+            if not values:
+                overall[field] = {"count": 0}
+                continue
+            overall[field] = {
+                "count": len(values),
+                "mean": round(statistics.fmean(values)),
+                "min": min(values),
+                "max": max(values),
+                "median": round(statistics.median(values)),
+                "p95": round(_p95(values)),
+            }
+
+        ended_at = datetime.datetime.now(datetime.timezone.utc)
+        report = {
+            "session": {
+                "started_at_utc": self.started_at.isoformat(),
+                "ended_at_utc": ended_at.isoformat(),
+                "duration_seconds": round((ended_at - self.started_at).total_seconds(), 1),
+                "turns": len(turns),
+                "barge_ins": self.total_barge_ins,
+            },
+            "overall": overall,
+            "per_turn": per_turn,
+        }
+
+        LATENCY_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = self.started_at.strftime("%Y%m%dT%H%M%SZ")
+        path = LATENCY_LOG_DIR / f"session_{stamp}.json"
+        suffix = 2
+        while path.exists():  # same-second starts don't clobber each other
+            path = LATENCY_LOG_DIR / f"session_{stamp}_{suffix}.json"
+            suffix += 1
+        with open(path, "w") as f:
+            json.dump(report, f, indent=2)
+        log.info("wrote latency log %s (%d turns)", path.name, len(turns))
 
     async def _send(self, payload: dict) -> None:
         await self.ws.send_text(json.dumps(payload))

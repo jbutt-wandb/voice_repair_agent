@@ -12,3 +12,6 @@ wheels/
 .env
 
 /docs/deepgram-application.md
+
+# Per-session latency logs
+session_logs/
