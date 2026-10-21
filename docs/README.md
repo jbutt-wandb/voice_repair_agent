@@ -19,5 +19,16 @@ quick reference). Read in order:
    *process* story: how this app was built in collaboration with a coding agent,
    and a transferable playbook for driving one yourself.
 
+## Strategy & research notes
+
+Forward-looking design studies (not part of the beginner walkthrough above):
+
+- **[deepgram-voice-agent-strategy.md](deepgram-voice-agent-strategy.md)** — what
+  changes if we use Deepgram's managed Voice Agent API (and Flux) instead of wiring
+  the cascade ourselves, plus best practices worth adopting either way.
+- **[open-source-voice-agents.md](open-source-voice-agents.md)** — a theoretical
+  swap of Deepgram for self-hosted open-source models (Qwen STT/TTS, Kyutai
+  CPU-capable TTS + STT), and what our modular architecture would look like.
+
 Reading the code afterwards? Start at `server/session.py` — its docstring is the
 wire protocol and the state machine; everything else hangs off it.
