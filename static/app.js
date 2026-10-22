@@ -25,6 +25,7 @@ let callEnded = false;        // agent hung up; tear down once audio drains
 let micOff = false;           // mic unavailable this session (text-only mode)
 let userBubble = null;        // current user utterance bubble (merges finals)
 let interimBubble = null;     // floating gray italic interim line
+let lastImageBubble = null;   // most recent photo thumbnail bubble (for the attach ack)
 const agentBubbles = new Map();   // turn_id -> element
 const metricRows = new Map();     // turn_id -> <tr>
 
@@ -45,7 +46,7 @@ async function startCall() {
   micOff = false;
   currentTurnId = 0;
   lastPlaybackTurn = -1;
-  userBubble = interimBubble = null;
+  userBubble = interimBubble = lastImageBubble = null;
   agentBubbles.clear();
   transcript.innerHTML = '';
   metricRows.clear();
@@ -270,6 +271,17 @@ function handleEvent(ev) {
       markInterrupted(ev.turn_id);
       break;
     }
+    case 'image_received': {
+      // Server is holding the photo for the next turn — mark the thumbnail.
+      if (lastImageBubble && !lastImageBubble.querySelector('.attached')) {
+        const tag = document.createElement('div');
+        tag.className = 'attached';
+        tag.textContent = 'attached ✓ — now tell me about it';
+        lastImageBubble.appendChild(tag);
+        scrollDown();
+      }
+      break;
+    }
     case 'turn_metrics': upsertMetrics(ev); break;
     case 'error': console.error('server error:', ev.message); break;
   }
@@ -346,6 +358,43 @@ $('text-form').onsubmit = (e) => {
     sendJson({ type: 'text_input', text });
     input.value = '';
   }
+};
+
+// ---------------------------------------------------------------- photo input
+
+// "Add photo" opens the file picker — no `capture` attribute, so the OS offers
+// both "Take Photo" and "Choose Existing" on mobile, and a file dialog on desktop.
+$('photo-btn').onclick = () => {
+  if (!ws) { alert('Start the call first, then add a photo.'); return; }
+  $('photo-input').click();
+};
+
+$('photo-input').onchange = (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';                 // allow re-picking the same file later
+  if (!file || !ws) return;
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(img.src);
+    // Downscale so the longest side is <= 1024 px — small enough not to stall the
+    // live audio stream and much cheaper for the vision model.
+    const MAX = 1024;
+    const scale = Math.min(1, MAX / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+
+    // Show the thumbnail as a user-side bubble, then send it to the server.
+    lastImageBubble = addBubble('user image');
+    const thumb = document.createElement('img');
+    thumb.src = dataUrl;
+    lastImageBubble.appendChild(thumb);
+    scrollDown();
+    sendJson({ type: 'image', data: dataUrl });
+  };
+  img.src = URL.createObjectURL(file);
 };
 
 // ---------------------------------------------------------------- resampling

@@ -15,3 +15,5 @@ wheels/
 
 # Per-session latency logs
 session_logs/
+# Local manual-test photos (not committed)
+scripts/images/

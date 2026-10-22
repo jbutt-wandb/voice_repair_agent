@@ -39,6 +39,26 @@ CONTEXT_KEEP_RECENT_MESSAGES = 8
 # Too low: TTS gets choppy fragments ("Yes." ... "So,"). Too high: TTFB suffers.
 MIN_SENTENCE_CHARS = 20
 
+# ---------------------------------------------------------------- image-turn filler
+# Spoken (via TTS) to mask the ~1.8s vision-model latency when the customer sends a
+# photo. These are NEVER sent to the LLM — zero extra tokens; audio only.
+IMAGE_FILLER_PHRASES = (
+    "Let me take a look.",
+    "One moment while I look at that.",
+    "Okay, let me see that.",
+)
+
+# ---------------------------------------------------------------- inactivity timeout
+# A silent (abandoned) call shouldn't stay open forever burning STT/TTS minutes.
+# After IDLE_PROMPT_S of silence the agent nudges once ("are you still there?"); if
+# still no response IDLE_HANGUP_S later it says goodbye and hangs up. Canned phrases,
+# spoken via TTS — never sent to the LLM. Env-overridable (handy for fast tests).
+IDLE_PROMPT_S = float(os.environ.get("IDLE_PROMPT_S", "15"))
+IDLE_HANGUP_S = float(os.environ.get("IDLE_HANGUP_S", "25"))
+IDLE_PROMPT_PHRASE = "Are you still there?"
+IDLE_GOODBYE_PHRASE = ("I'll let you go for now. Call back any time you need a hand. "
+                       "Goodbye.")
+
 SERVER_HOST = os.environ.get("HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("PORT", "8000"))
 

@@ -47,6 +47,8 @@ button {
 }
 button:hover { filter: brightness(1.1); }
 button.live { background: var(--red); color: #fff; }
+/* "Add photo" is secondary — keep Start call the primary (accent) action. */
+#photo-btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); }
 
 .badge {
   font-size: 12px;
@@ -100,6 +102,9 @@ main {
 .bubble.interim { align-self: flex-end; background: transparent;
                   border: 1px dashed var(--border); color: var(--muted); font-style: italic; }
 .bubble .interrupted { color: var(--muted); font-style: italic; font-size: 12px; }
+.bubble.image { padding: 6px; }
+.bubble.image img { display: block; max-width: 220px; width: 100%; border-radius: 8px; }
+.bubble .attached { color: var(--green); font-size: 11px; margin-top: 4px; }
 .bubble.syswarn {
   align-self: center;
   max-width: 92%;

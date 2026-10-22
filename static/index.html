@@ -14,6 +14,8 @@
     </div>
     <div class="controls">
       <span id="state-badge" class="badge idle">disconnected</span>
+      <button id="photo-btn" title="Take a photo or choose an existing image">Add photo</button>
+      <input id="photo-input" type="file" accept="image/*" hidden>
       <button id="connect-btn">Start call</button>
     </div>
   </header>
@@ -29,16 +31,7 @@
     </section>
 
     <aside id="side-panel">
-      <div class="card">
-        <h2>Pipeline</h2>
-        <div id="pipeline">
-          <span class="stage" data-stage="mic">Mic</span><span class="arrow">&rarr;</span>
-          <span class="stage" data-stage="stt">STT</span><span class="arrow">&rarr;</span>
-          <span class="stage" data-stage="llm">LLM</span><span class="arrow">&rarr;</span>
-          <span class="stage" data-stage="tts">TTS</span><span class="arrow">&rarr;</span>
-          <span class="stage" data-stage="spk">Speaker</span>
-        </div>
-      </div>
+      
 
       <div class="card">
         <h2>Per-turn latency (ms)</h2>

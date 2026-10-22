@@ -129,11 +129,21 @@ matter later; drop all chit-chat and wording. Always keep:
 Write terse bullet-like prose, max ~150 words. Output only the notes."""
 
 
+def _content_text(content) -> str:
+    """Flatten a message's content to text. Content is usually a string, but an
+    image-bearing user turn is a list of parts ({type:text|image_url}); keep only
+    the text so the transcript never serializes a raw list / base64 blob."""
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content
+                        if isinstance(p, dict) and p.get("type") == "text").strip()
+    return content or ""
+
+
 async def summarize_history(client: AsyncOpenAI, old_messages: list[dict]) -> str:
     """Compress old conversation turns into compact call notes. Runs BETWEEN agent
     turns (never on the latency path) — see session.py::_maybe_summarize."""
     transcript = "\n".join(
-        f"{m['role'].upper()}: {m.get('content') or '[tool call]'}"
+        f"{m['role'].upper()}: {_content_text(m.get('content')) or '[tool call]'}"
         for m in old_messages if m.get("role") in ("user", "assistant", "tool")
     )
     resp = await client.chat.completions.create(
