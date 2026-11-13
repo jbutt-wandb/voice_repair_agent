@@ -125,8 +125,9 @@ LATENCY_LOG_DIR = Path(__file__).resolve().parent.parent / "session_logs"
 # no-op when WANDB_API_KEY is missing, so it never affects the live call.
 WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "wandb-smle")
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "jb_voice_deepgram_agent")
-# Master switch (env "0"/"false" to disable even when a key is present).
-WEAVE_ENABLED = os.environ.get("WEAVE_ENABLED", "1").lower() not in ("0", "false", "no")
+# Master switch. On this branch tracing is OFF by default (the app is fully
+# functional without W&B); set WEAVE_ENABLED=1 (plus WANDB_API_KEY) to opt in.
+WEAVE_ENABLED = os.environ.get("WEAVE_ENABLED", "0").lower() not in ("0", "false", "no")
 # Whether to attach the caller's photo and recorded utterance audio to each turn.
 WEAVE_CAPTURE_MEDIA = os.environ.get("WEAVE_CAPTURE_MEDIA", "1").lower() not in ("0", "false", "no")
 

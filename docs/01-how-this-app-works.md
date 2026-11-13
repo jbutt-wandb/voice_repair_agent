@@ -424,15 +424,14 @@ Notice the stages roughly add up: endpoint wait + TTFT + TTFB ≈ voice-to-voice
 That's the point of per-stage metrics — when the total is too slow, you know
 *which* stage to attack.
 
-### Beyond the live panel: tracing a finished call
+### Beyond the live panel: reviewing a finished call
 
 The metrics panel is for *now*; reviewing a call *later* is a different need. When
-Weave tracing is enabled, every turn is also shipped to W&B Weave as a structured
-span tree — the transcript, the per-stage latencies above, tool calls, token cost,
-and even the audio of *both* sides of the turn — so you can scrub a real
-conversation after the fact. Crucially, that trace is assembled and flushed at the
-*turn boundary, off the voice hot path*, so it adds exactly zero to the second you
-just measured. The full design is in
+a session ends, the server writes a timestamped JSON summary to `session_logs/` —
+every turn's per-stage latencies plus aggregate mean/median/p95 per metric
+(`session.py::_write_latency_log`). Crucially, it's written once at teardown, *off
+the voice hot path*, so it adds exactly zero to the second you just measured. What
+production observability adds on top is in
 [doc 03 §10](03-production-challenges.md#10-observability-you-cant-debug-voice-from-text-logs).
 
 ## Recap: the full journey in 12 steps

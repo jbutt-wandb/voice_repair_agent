@@ -15,19 +15,14 @@ quick reference). Read in order:
 3. **[03-production-challenges.md](03-production-challenges.md)** — what gets hard
    in the wild: latency tails, WER, echo, turn-taking, cancellation correctness,
    context growth (incl. photo→text memory), safety guardrails and the scope block,
-   scaling, cost, and a worked-example observability layer (per-turn W&B Weave
-   traces) — all added under one rule: never regress voice-to-voice latency.
+   scaling, cost, and observability — all added under one rule: never regress
+   voice-to-voice latency.
 4. **[04-building-this-with-an-agent.md](04-building-this-with-an-agent.md)** — the
    *process* story: how this app was built in collaboration with a coding agent,
    and a transferable playbook for driving one yourself.
 5. **[05-architecture.md](05-architecture.md)** — how it all links together, in
-   diagrams: the system map (browser ↔ session ↔ STT/LLM/TTS, with observability
-   off the hot path) and one voice turn as a timeline, through to the vocal judge
-   and the Weave trace.
-6. **[06-weights-and-biases.md](06-weights-and-biases.md)** — the W&B integration in
-   practice: what each `voice_turn` trace carries, where to look in the Weave UI,
-   why transcript quality is a zero-code Monitor but acoustic emotion had to be an
-   in-process judge, and the config knobs.
+   diagrams: the system map (browser ↔ session ↔ STT/LLM/TTS) and one voice turn
+   as a timeline.
 
 ## Strategy & research notes
 

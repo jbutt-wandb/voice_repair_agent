@@ -8,13 +8,13 @@ codebase touches it, and sketches what production actually does.
 
 **One principle runs through all of it: every feature must preserve voice-to-voice
 latency.** That is the hard constraint a voice agent lives under, and it is the
-reason the later features in this project look the way they do. Observability
-(§10), the tighter safety scope (§7), snappier barge-in (§5), and photo memory (§6)
-were *all* added without a latency regression — each one was deliberately designed
-to keep its work off the real-time hot path (traces assembled at the turn boundary,
-photo descriptions generated as trailing text after the spoken reply, interruption
-moved to a signal that only *shortens* time-to-interrupt). When you read those
-sections, watch for where the work was moved *to*; that's the transferable idea.
+reason the later features in this project look the way they do. The tighter safety
+scope (§7), snappier barge-in (§5), and photo memory (§6) were *all* added without
+a latency regression — each one was deliberately designed to keep its work off the
+real-time hot path (photo descriptions generated as trailing text after the spoken
+reply, interruption moved to a signal that only *shortens* time-to-interrupt). When
+you read those sections, watch for where the work was moved *to*; that's the
+transferable idea.
 
 ## 1. Latency: budget like money, measure like tails
 
@@ -348,94 +348,15 @@ When a user says "it talked over me and then booked the wrong thing," you need:
   as the trace ID that ties a user complaint to the exact STT results, LLM call,
   and TTS stream involved.
 
-### The implemented answer: a W&B Weave trace per turn
-
-This app does more than log a line — it ships a full, reviewable trace tree to
-**W&B Weave** (`server/weave_trace.py`), so a completed conversation can be replayed
-afterward with its transcript, per-stage latency, tool use, cost, *and audio*. It's a
-worked example of all three bullets above at once, and — like rolling summarization in
-§6 — it was built to the project's hard rule: **it adds zero voice-to-voice latency.**
-
-The trace contract is deliberately strict (that's the whole point — a trace you can't
-rely on the shape of is a trace you can't chart across turns):
-
-```
-Session            = one weave.thread(session_id)   — groups every turn of a call
-└─ voice_turn       one root span per model-driven turn
-   │  inputs   {turn_id, user_text, image, user_audio, tts_audio}
-   │  output   {assistant_text, tool_calls[], interrupted, ended}
-   │  attrs    latency (ms), token usage, cost, barge_in, filler_used,
-   │           image_autosend, idle_timeout
-   ├─ llm_completion   inputs {messages (base64 image REDACTED)}  output {text, usage}
-   ├─ tool_<name>      inputs = parsed args                        output = result
-   └─ speak            inputs {text}                               one per spoken sentence
-```
-
-(Since this was written, the `voice_turn` output also carries `vocal_frustrated` /
-`vocal_fearful` — an acoustic verdict on the caller's mic audio from an in-process
-judge, `server/vocal_judge.py`; [doc 06](06-weights-and-biases.md) explains why a
-server-side Weave monitor couldn't do that job.)
-
-Four design choices are worth stealing:
-
-- **The span tree is assembled at the *turn boundary*, not live inline.** A turn is
-  spread across asyncio tasks — STT finalizes in one, the LLM runs in another, TTS
-  audio completes in a third — so rather than fight that with live span wrapping, the
-  code *collects* a turn's data as it happens and emits the whole tree once, after the
-  caller has already heard the reply. All the heavy work (image decode, WAV wrapping,
-  network flush) lands here, off the hot path; Weave itself flushes on a background
-  thread. That's *why* latency is zero.
-
-- **Latency lives in `attributes`, not `output`.** `stt_final_ms`, `llm_ttft_ms`,
-  `tts_ttfb_ms`, `v2v_server_ms`, `v2v_client_ms`, the headline `voice_to_voice_ms`,
-  token counts, `est_cost_usd`, and the `barge_in` / `filler_used` / `image_autosend`
-  / `idle_timeout` flags are all call *attributes* — which Weave makes filterable and
-  chartable *across* turns (p95 TTFT, barge-in rate, cost per turn), exactly the
-  aggregation the bullets ask for. Because attributes are frozen at call creation and
-  the metrics aren't known until the turn ends, this is the second reason the tree is
-  built post-hoc: emit early and the numbers wouldn't exist yet.
-
-- **We record the LLM call ourselves instead of auto-patching.** Weave can
-  auto-instrument the OpenAI client, but that path (as of weave 0.53.12) can't redact
-  the base64 image buried in a multimodal `messages` array, and it freezes the span's
-  attributes before our per-turn metrics exist. So the auto-patch span is suppressed
-  (`suppress_autotrace()` around the live call in `llm.py`) and `llm_completion` is
-  recorded by hand with the image **redacted** and the token usage folded in. No raw
-  image bytes ever leave the box.
-
-- **Canned speech is not a `voice_turn`.** The greeting, the image filler, and the
-  idle nudge/goodbye aren't model turns, so they're recorded as their own
-  `system_utterance` root ops (with their own audio) — model-generated speech is never
-  confused with scripted speech, yet *all* agent audio is captured.
-
-### Hearing both sides
-
-The feature text alone can't surface a WER or echo problem — so when
-`WEAVE_CAPTURE_MEDIA` is on, each `voice_turn` carries **two separate audio streams**:
-`user_audio` (the caller's 16 kHz mic for that turn) and `tts_audio` (the agent's
-24 kHz spoken reply). They're kept separate rather than spliced — partly so a reviewer
-can scrub each side on its own, partly because they're genuinely *different sample
-rates*. Keeping the right audio on the right turn reuses the same machinery that makes
-barge-in correct: the TTS turn-tagging staleness check plus a per-turn buffer reset
-stop one turn's audio from bleeding into the next. (The caller's photo, decoded, rides
-along as the turn's `image` input.)
-
-### Turning it on
-
-Config lives in `server/config.py`, all env-overridable: `WANDB_ENTITY` /
-`WANDB_PROJECT` (default `wandb-smle/jb_voice_deepgram_agent`), `WEAVE_ENABLED` (master
-switch), and `WEAVE_CAPTURE_MEDIA` (attach photo + audio). The whole layer degrades to
-a **no-op** when `WANDB_API_KEY` is absent, so the app runs identically with or without
-it. One subtlety worth copying: `.env` is loaded in `config.py` itself, not just in
-`main.py` — the live server is launched as `uvicorn server.app:app`, which never runs
-`main.py`, and without that early load the key would be missing in the uvicorn process
-and tracing would silently stay off.
-
-A metric worth singling out: **barge-in rate** — now a first-class, filterable trace
-attribute. Rising barge-ins mean either the agent talks too much (prompt problem) or
-it misheard and answered the wrong question (STT problem). Read (or now, *listen to*)
-the traces before deciding which — it's a symptom with two diseases, and this is
-exactly the kind of question the per-turn trace tree exists to answer.
+What this repo implements: beyond the per-turn structured log line, each session
+writes a timestamped latency summary JSON to `session_logs/` when it ends
+(`server/session.py::_write_latency_log`) — every turn's per-stage metrics plus
+aggregate mean/median/p95 per field. It's written once at teardown, so — like
+rolling summarization in §6 — it honors the project's hard rule: **zero added
+voice-to-voice latency.** Production builds the rest of the list above on top:
+percentile dashboards with alerting, and audio + transcript retention (with consent
+and a retention policy), because WER, echo, and endpointing problems are inaudible
+in text.
 
 ## The one-table summary
 
@@ -450,7 +371,7 @@ exactly the kind of question the per-turn trace tree exists to answer.
 | Safety | prompt rules + scope block + manual-grounded LLM-judge (16 scenarios) | + output guardrail, red-teaming, SLO |
 | Connections | KeepAlive, lazy reconnect, clean teardown | mid-call recovery with backoff |
 | Scale/cost | 1 async process, ~$0.03–0.05/min math | sticky routing, cost per segment |
-| Observability | per-turn Weave trace tree (transcript, latency, audio, cost) | + percentiles, retention, alerting |
+| Observability | per-turn structured log + per-session latency JSON (`session_logs/`) | + percentiles, retention, alerting |
 
 If you remember one thing: **a voice agent is a real-time distributed system that
 happens to contain an LLM.** The LLM is the easy part.

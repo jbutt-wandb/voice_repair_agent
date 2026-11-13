@@ -17,13 +17,11 @@ Prerequisites: [uv](https://docs.astral.sh/uv/) and Chrome. Python 3.14 is pinne
 git clone <this-repo> && cd voice_repair_agent
 ```
 
-Create a `.env` in the project root with two required keys and one optional one:
+Create a `.env` in the project root with two required keys:
 
 ```bash
 DEEPGRAM_API_KEY=...   # create one at https://console.deepgram.com/
 OPENAI_API_KEY=...     # create one at https://platform.openai.com/api-keys
-WANDB_API_KEY=...      # OPTIONAL: https://wandb.ai/authorize — enables W&B Weave
-                       # tracing; without it the app runs fine, tracing just disables
 ```
 
 Then run it:
@@ -58,9 +56,8 @@ uv run python -m server.stt      # standalone STT smoke test (loops TTS audio in
 ```
 
 New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
-pieces link together in diagrams, and
-[docs/06-weights-and-biases.md](docs/06-weights-and-biases.md) explains the W&B Weave
-integration. The full explainer series lives in [docs/](docs/README.md).
+pieces link together in diagrams. The full explainer series lives in
+[docs/](docs/README.md).
 
 ## Configuration
 
@@ -77,13 +74,6 @@ accept `0`/`false`/`no` as off):
 | Images | `IMAGE_AUTOSEND_S` | `2.0` | a lone photo (no speech) auto-starts a turn after this many seconds |
 | Idle timeout | `IDLE_PROMPT_S` | `15` | silence before the "are you still there?" nudge |
 | Idle timeout | `IDLE_HANGUP_S` | `25` | further silence before goodbye + hang-up |
-| Weave | `WEAVE_ENABLED` | `1` | master switch for tracing (also off whenever `WANDB_API_KEY` is absent) |
-| Weave | `WEAVE_CAPTURE_MEDIA` | `1` | attach caller mic / reply audio / photo to each turn's trace |
-| Weave | `WANDB_ENTITY` | `wandb-smle` | W&B entity (team) the traces ship to |
-| Weave | `WANDB_PROJECT` | `jb_voice_deepgram_agent` | W&B project the traces ship to |
-| Vocal judge | `VOCAL_JUDGE_ENABLED` | `1` | per-turn acoustic frustration/fear verdict on the caller's mic audio |
-| Vocal judge | `VOCAL_JUDGE_MODEL` | `gpt-audio-mini` | OpenAI audio model doing the judging |
-| Vocal judge | `VOCAL_JUDGE_TIMEOUT_S` | `8.0` | judge deadline; on timeout the trace ships without vocal flags |
 
 \* `STT_ENDPOINTING_MS` is a constant in `config.py` (edit the file), not an env var —
 it's a product decision, not a deploy-time setting (see Production considerations §1).
@@ -254,9 +244,7 @@ metrics panel and logged as one structured line per turn):
 Notes for production measurement:
 - **Voice-to-voice is the product metric.** Humans expect a reply within ~500 ms and
   get uncomfortable past ~1.5 s. Track p50 *and* p95/p99 — tail latency is what users
-  remember. The stage breakdown exists so you know *which* stage to fix. Every field
-  here is also emitted as a filterable **Weave trace attribute** per turn (see
-  Production considerations §9), so the p95-by-stage view is a query, not a scraper.
+  remember. The stage breakdown exists so you know *which* stage to fix.
 - `stt_final_ms` here approximates endpoint wait using arrival times; rigorous STT
   lag measurement needs audio-sample timestamps compared against transcript word timings.
 - **Barge-in rate** is a proxy for two different problems: the agent talks too much
@@ -320,17 +308,12 @@ Notes for production measurement:
    TTS is. A bigger LLM or longer prompt changes that math fast.
 9. **Observability.** One structured log line per turn (always on) is the atom;
    aggregate into dashboards (latency percentiles, barge-in rate, booking conversion,
-   safety-eval pass rate). On top of that, this app ships a full **W&B Weave trace
-   tree per turn** (`server/weave_trace.py`): one `weave.thread` per call, one
-   `voice_turn` span per turn with `llm_completion` / `tool_*` / `speak` children,
-   latency + token cost + flags as filterable call *attributes*, and — because you
-   cannot debug a voice agent from text alone — both sides of the turn as audio
-   (16 kHz caller mic + 24 kHz agent reply, kept separate). The LLM span is recorded by
-   hand (not via auto-patch) so the base64 image is **redacted**. The entire tree is
-   assembled at the turn boundary and flushed on a background thread, so it adds **zero
-   voice-to-voice latency**; it's a no-op without `WANDB_API_KEY`. Knobs:
-   `WEAVE_ENABLED`, `WEAVE_CAPTURE_MEDIA`, `WANDB_ENTITY`, `WANDB_PROJECT` (see
-   `server/config.py`). Record audio + transcripts with consent and a retention policy.
+   safety-eval pass rate). On top of that, each session writes a timestamped latency
+   summary JSON to `session_logs/` on teardown (`session.py::_write_latency_log`):
+   every turn's per-stage metrics plus aggregate mean/median/p95 per field — written
+   once at session end, never on the voice hot path. Production adds audio recordings
+   with transcripts (captured with consent and a retention policy) and per-turn
+   tracing, because you cannot debug a voice agent from text alone.
 
 ## Repository layout
 
@@ -344,7 +327,6 @@ server/stt.py               Deepgram live STT wrapper (+ `python -m server.stt` 
 server/tts.py               Deepgram live TTS wrapper (+ `python -m server.tts` smoke test)
 server/llm.py               OpenAI streaming, tool loop, sentence chunker, summarizer
 server/agent.py             ★ safety surface: manuals → system prompt, scope rules, booking + end_call tools
-server/weave_trace.py       W&B Weave tracing: one span tree per turn, built off the hot path
 manuals/*.md                4 simulated product manuals (safe vs. specialist-only)
 static/index.html,app.js    UI: transcript, pipeline stages, live metrics table
 static/capture-worklet.js   mic → 16 kHz int16 frames
