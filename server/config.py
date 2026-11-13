@@ -129,3 +129,14 @@ WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "jb_voice_deepgram_agent")
 WEAVE_ENABLED = os.environ.get("WEAVE_ENABLED", "1").lower() not in ("0", "false", "no")
 # Whether to attach the caller's photo and recorded utterance audio to each turn.
 WEAVE_CAPTURE_MEDIA = os.environ.get("WEAVE_CAPTURE_MEDIA", "1").lower() not in ("0", "false", "no")
+
+# ---------------------------------------------------------------- vocal judge
+# Acoustic frustration/fear classification of the caller's per-turn mic audio by an
+# OpenAI audio model. Runs in a background task AFTER the turn ends (never on the
+# voice hot path); its verdict lands in voice_turn.output as vocal_frustrated /
+# vocal_fearful (null when there is no mic audio or the judge fails/times out).
+# Server-side Weave monitors can't read weave.Audio inputs, hence this in-process
+# path (see docs/03-production-challenges.md).
+VOCAL_JUDGE_ENABLED = os.environ.get("VOCAL_JUDGE_ENABLED", "1").lower() not in ("0", "false", "no")
+VOCAL_JUDGE_MODEL = os.environ.get("VOCAL_JUDGE_MODEL", "gpt-audio-mini")
+VOCAL_JUDGE_TIMEOUT_S = float(os.environ.get("VOCAL_JUDGE_TIMEOUT_S", "8.0"))

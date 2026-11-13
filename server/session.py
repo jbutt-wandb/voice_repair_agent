@@ -60,9 +60,10 @@ from .config import (BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
                      DEFAULT_IMAGE_PROMPT, IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S,
                      IDLE_PROMPT_PHRASE, IDLE_PROMPT_S, IMAGE_AUTOSEND_S,
                      IMAGE_FILLER_PHRASES, IMAGE_NOTE_REMINDER, LATENCY_LOG_DIR,
-                     MIN_SENTENCE_CHARS)
+                     MIN_SENTENCE_CHARS, VOCAL_JUDGE_ENABLED)
 from .stt import DeepgramSTT, SpeechStarted, Transcript, UtteranceEnd
 from .tts import AudioChunk, Cleared, DeepgramTTS, Flushed
+from .vocal_judge import classify_vocal
 from .weave_trace import SessionTracer
 
 log = logging.getLogger("session")
@@ -216,6 +217,9 @@ class Session:
         self.session_id = uuid.uuid4().hex
         self.trace = SessionTracer(self.session_id)
         self.tt = None                      # current turn's trace accumulator (or None)
+        # In-flight judge-then-trace tasks (one per finished turn). Teardown AWAITS
+        # these (briefly) instead of cancelling, or the last turn's trace would be lost.
+        self._judge_tasks: set[asyncio.Task] = set()
         # Rolling buffer of this turn's mic PCM, snapshotted as the turn's user audio.
         self._mic_buf = bytearray()
         # Agent-audio capture for the trace, filled from the TTS output in _tts_rx and
@@ -252,8 +256,13 @@ class Session:
                     if t.exception():
                         log.error("task %s failed", t.get_name(), exc_info=t.exception())
             finally:
+                # Let in-flight judge-then-trace tasks finish (bounded) BEFORE the
+                # cancel sweep — cancelling them would drop the final turns' traces.
+                if self._judge_tasks:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait(self._judge_tasks, timeout=10)
                 for extra in (self.agent_task, self.summarize_task, self.close_task,
-                              self._image_autosend_task):
+                              self._image_autosend_task, *self._judge_tasks):
                     if extra:
                         extra.cancel()
                 for t in tasks:
@@ -685,9 +694,9 @@ class Session:
         # attaching the agent's spoken-reply audio captured in _tts_rx.
         if self.tt:
             self.tt.set_tts_audio(bytes(self._tts_buf))
-            self.trace.finish_turn(self.tt, assistant_text=self.tt.reply_text,
-                                   interrupted=False, ended=self.ending,
-                                   metrics=self.metrics)
+            self._spawn_judge_and_trace(self.tt, assistant_text=self.tt.reply_text,
+                                        interrupted=False, ended=self.ending,
+                                        metrics=self.metrics)
             self.tt = None
         if self.ending:
             # The agent said goodbye and all of its audio is flushed. Tell the client
@@ -712,6 +721,31 @@ class Session:
         if (self.summarize_task is None or self.summarize_task.done()) \
                 and self._history_tokens() > CONTEXT_MAX_HISTORY_TOKENS:
             self.summarize_task = asyncio.create_task(self._summarize_history())
+
+    def _spawn_judge_and_trace(self, tt, *, assistant_text: str, interrupted: bool,
+                               ended: bool, metrics) -> None:
+        """Hand a finished turn to a background task that (1) classifies the caller's
+        vocal emotion and (2) emits the turn's Weave trace with the verdict in its
+        output. Fire-and-forget: nothing on the voice path awaits it, so the judge's
+        latency only delays when the trace APPEARS, never the call itself. Safe to
+        detach because tt is handed off (self.tt is nulled by the caller) and a fresh
+        TurnMetrics is created per turn."""
+        task = asyncio.create_task(
+            self._judge_and_trace(tt, assistant_text, interrupted, ended, metrics),
+            name=f"judge_turn_{tt.turn_id}")
+        self._judge_tasks.add(task)
+        task.add_done_callback(self._judge_tasks.discard)
+
+    async def _judge_and_trace(self, tt, assistant_text: str, interrupted: bool,
+                               ended: bool, metrics) -> None:
+        vocal = None
+        # Only turns with real mic audio get judged (typed/image-autosend turns have
+        # none), and only when the trace will actually be emitted.
+        if VOCAL_JUDGE_ENABLED and self.trace.enabled and tt.audio_pcm:
+            vocal = await classify_vocal(self.openai, tt.audio_pcm)
+        self.trace.finish_turn(tt, assistant_text=assistant_text,
+                               interrupted=interrupted, ended=ended,
+                               metrics=metrics, vocal=vocal)
 
     def _mark_activity(self) -> None:
         """Any real user input (speech, typing, a photo) resets the inactivity
@@ -921,7 +955,7 @@ class Session:
         self._flush_system_utterance()
         if self.tt:
             self.tt.set_tts_audio(bytes(self._tts_buf))
-            self.trace.finish_turn(
+            self._spawn_judge_and_trace(
                 self.tt, assistant_text=" ".join(self.spoken_sentences).strip(),
                 interrupted=True, ended=False, metrics=self.metrics)
             self.tt = None

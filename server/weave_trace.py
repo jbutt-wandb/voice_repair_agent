@@ -22,7 +22,8 @@ Session           weave.thread(session_id)         all turns of one call grouped
    │  inputs      {turn_id, user_text, image, user_audio, tts_audio}  (media = weave | None)
    │                 user_audio = the caller's mic for this turn (16 kHz)
    │                 tts_audio  = the agent's SPOKEN REPLY for this turn (24 kHz)
-   │  output      {assistant_text, tool_calls[], interrupted, ended}
+   │  output      {assistant_text, tool_calls[], interrupted, ended,
+   │               vocal_frustrated, vocal_fearful}   (bool | null — see vocal_judge.py)
    │  attributes  latency (ms), barge_in, idle_timeout, filler_used, image_autosend,
    │              token usage, cost
    ├─ llm_completion   inputs {messages}  — base64 image data REDACTED
@@ -202,7 +203,8 @@ class SessionTracer:
         return TurnTrace(turn_id, user_text) if self.enabled else None
 
     def finish_turn(self, tt: TurnTrace | None, *, assistant_text: str,
-                    interrupted: bool, ended: bool, metrics=None) -> None:
+                    interrupted: bool, ended: bool, metrics=None,
+                    vocal: dict | None = None) -> None:
         """Build and flush the whole voice_turn tree. Called at the turn boundary."""
         if not (self.enabled and tt is not None):
             return
@@ -259,6 +261,10 @@ class SessionTracer:
                                    for n, a, r, _, _ in tt.tools],
                     "interrupted": interrupted,
                     "ended": ended,
+                    # Acoustic verdict on the caller's mic audio (vocal_judge.py);
+                    # null = no mic audio this turn, judge disabled, or judge failed.
+                    "vocal_frustrated": vocal.get("frustrated") if vocal else None,
+                    "vocal_fearful": vocal.get("fearful") if vocal else None,
                 }, ended_at=_now())
         except Exception:
             log.exception("weave finish_turn failed (turn %s); ignoring", tt.turn_id)
