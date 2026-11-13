@@ -756,7 +756,7 @@ class Session:
                 log_agent_turn, session_id=self.session_id, tt=tt,
                 assistant_text=assistant_text, interrupted=interrupted, ended=ended,
                 metrics=metrics, system_prompt=str(self.messages[0]["content"]),
-                stt_rate=STT_SAMPLE_RATE, tts_rate=TTS_SAMPLE_RATE)
+                stt_rate=STT_SAMPLE_RATE, tts_rate=TTS_SAMPLE_RATE, vocal=vocal)
 
     def _mark_activity(self) -> None:
         """Any real user input (speech, typing, a photo) resets the inactivity
