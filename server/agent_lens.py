@@ -29,15 +29,29 @@ from .weave_trace import _pcm16_to_wav
 log = logging.getLogger("agent_lens")
 
 
-def _attach_audio(llm, pcm: bytes | None, sample_rate: int) -> None:
-    """Attach one audio stream to the chat span via the SDK's attach_media —
-    the ONLY path the conversation UI renders (it also stamps the span's
-    weave.content_refs attribute, which authorizes the media fetch; UriPart
-    message parts alone do NOT render — verified empirically). Failures are
-    attach_media's problem: a failed upload is dropped before span emission."""
-    if pcm:
-        llm.attach_media(content=_pcm16_to_wav(pcm, sample_rate),
-                         mime_type="audio/wav", modality="audio")
+def _audio_uri_part(pcm: bytes | None, sample_rate: int):
+    """Publish one audio stream and return a UriPart for it, or None.
+
+    Why not attach_media: the SDK serializer hardwires attachments onto the
+    last USER message (_serialize_input_messages(media=...)), so the agent's
+    reply audio would render in the caller's bubble. The chat view assigns
+    media per-role by matching each message's uri parts against the span's
+    weave.content_refs — so we publish the ref ourselves, place the UriPart
+    in the correct-role message, and stamp content_refs via log_turn's
+    attributes (see log_agent_turn). Returns None on failure: the turn then
+    ships that bubble text-only."""
+    if not pcm:
+        return None
+    try:
+        from weave.conversation.conversation import _publish_media_content
+        from weave.conversation.types import UriPart
+        ref = _publish_media_content(
+            content=_pcm16_to_wav(pcm, sample_rate), uri="", file_id="",
+            mime_type="audio/wav")
+        return UriPart(uri=ref, mime_type="audio/wav", modality="audio")
+    except Exception:
+        log.exception("audio publish failed; emitting turn without this clip")
+        return None
 
 
 def log_agent_turn(*, session_id: str, tt, assistant_text: str, interrupted: bool,
@@ -51,28 +65,37 @@ def log_agent_turn(*, session_id: str, tt, assistant_text: str, interrupted: boo
         import weave
         from weave import Message
         from weave.conversation.conversation import LLM, Tool
-        from weave.conversation.types import Usage
+        from weave.conversation.types import TextPart, Usage
 
-        user_msg = Message(role="user", content=tt.user_text or "(no speech)")
-        out_msg = Message(role="assistant", content=assistant_text)
+        user_audio = _audio_uri_part(tt.audio_pcm, stt_rate)
+        tts_audio = _audio_uri_part(tt.tts_pcm, tts_rate)
+        content_refs = [p.uri for p in (user_audio, tts_audio) if p is not None]
+
+        def msg(role: str, text: str, audio) -> Message:
+            if audio is None:
+                return Message(role=role, content=text)
+            return Message(role=role, parts=[TextPart(content=text), audio])
+
+        user_msg = msg("user", tt.user_text or "(no speech)", user_audio)
+        out_msg = msg("assistant", assistant_text, tts_audio)
 
         usage = tt.usage or {}
         now = datetime.datetime.now(datetime.timezone.utc)
+        # The chat span carries the SAME parts-based messages as the turn: the
+        # chat view dedupes bubbles by (text, media) signature, so identical
+        # messages collapse into one user and one assistant bubble, each with
+        # its own audio, while the chat span keeps model/usage/cost metadata.
         llm = LLM(
             model=LLM_MODEL,
             provider_name="openai",
-            input_messages=[Message(role="user", content=tt.user_text or "")],
-            output_messages=[Message(role="assistant", content=assistant_text)],
+            input_messages=[user_msg],
+            output_messages=[out_msg],
             usage=Usage(input_tokens=usage.get("prompt_tokens") or 0,
                         output_tokens=usage.get("completion_tokens") or 0,
                         total_tokens=usage.get("total_tokens")),
             started_at=tt.llm_started or tt.started_at,
             ended_at=tt.llm_ended or now,
         )
-        # Caller mic first, agent reply second: "Play all" then replays the
-        # exchange in natural order.
-        _attach_audio(llm, tt.audio_pcm, stt_rate)
-        _attach_audio(llm, tt.tts_pcm, tts_rate)
         spans: list = [llm]
         for name, args, result, started, ended_ts in tt.tools:
             spans.append(Tool(name=name, arguments=str(args),
@@ -82,6 +105,12 @@ def log_agent_turn(*, session_id: str, tt, assistant_text: str, interrupted: boo
         # would filter on. Mirrors — not replaces — the voice_turn trace fields.
         attrs = {"app.interrupted": interrupted, "app.call_ended": ended,
                  "app.turn_id": tt.turn_id}
+        if content_refs:
+            # Authorizes the UI to resolve the UriParts above; per-role media
+            # assignment comes from which message carries which part. No span
+            # here sets this itself (we don't use attach_media), so stamping it
+            # via attributes is collision-free.
+            attrs["weave.content_refs"] = content_refs
         if metrics is not None:
             v2v = metrics.v2v_client_ms if metrics.v2v_client_ms is not None \
                 else metrics.v2v_server_ms
