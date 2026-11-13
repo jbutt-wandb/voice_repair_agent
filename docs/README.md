@@ -20,6 +20,14 @@ quick reference). Read in order:
 4. **[04-building-this-with-an-agent.md](04-building-this-with-an-agent.md)** — the
    *process* story: how this app was built in collaboration with a coding agent,
    and a transferable playbook for driving one yourself.
+5. **[05-architecture.md](05-architecture.md)** — how it all links together, in
+   diagrams: the system map (browser ↔ session ↔ STT/LLM/TTS, with observability
+   off the hot path) and one voice turn as a timeline, through to the vocal judge
+   and the Weave trace.
+6. **[06-weights-and-biases.md](06-weights-and-biases.md)** — the W&B integration in
+   practice: what each `voice_turn` trace carries, where to look in the Weave UI,
+   why transcript quality is a zero-code Monitor but acoustic emotion had to be an
+   in-process judge, and the config knobs.
 
 ## Strategy & research notes
 

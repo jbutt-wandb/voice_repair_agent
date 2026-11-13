@@ -8,12 +8,27 @@ dangerous, and books a (simulated) engineer visit when a specialist is needed.
 Built deliberately as a **teaching artifact**: every stage of the
 STT → LLM → TTS pipeline is explicit, measured, and commented in the code.
 
-## Quickstart
+## Getting started
+
+Prerequisites: [uv](https://docs.astral.sh/uv/) and Chrome. Python 3.14 is pinned in
+`.python-version`; uv installs it (and all dependencies) automatically on first run.
 
 ```bash
-# .env must contain DEEPGRAM_API_KEY and OPENAI_API_KEY
-# (optional) add WANDB_API_KEY to ship per-turn traces to W&B Weave; without it, tracing no-ops
-uv sync
+git clone <this-repo> && cd voice_repair_agent
+```
+
+Create a `.env` in the project root with two required keys and one optional one:
+
+```bash
+DEEPGRAM_API_KEY=...   # create one at https://console.deepgram.com/
+OPENAI_API_KEY=...     # create one at https://platform.openai.com/api-keys
+WANDB_API_KEY=...      # OPTIONAL: https://wandb.ai/authorize — enables W&B Weave
+                       # tracing; without it the app runs fine, tracing just disables
+```
+
+Then run it:
+
+```bash
 uv run main.py            # serves http://127.0.0.1:8000  (PORT=8001 uv run main.py to change)
 ```
 
@@ -33,12 +48,45 @@ Open the URL in **Chrome**, click **Start call**, grant the mic, and **use headp
   and it auto-sends after ~2 s. It also *remembers* what the photo showed on later turns.
 - Type in the text box instead of speaking → same pipeline minus STT (great for testing).
 
+Verification gates and smoke tests:
+
 ```bash
 uv run scripts/safety_check.py   # the safety evaluation gate (see below)
 uv run scripts/e2e_check.py      # full-pipeline check over the real WebSocket (server must be up)
 uv run python -m server.tts      # standalone TTS smoke test
 uv run python -m server.stt      # standalone STT smoke test (loops TTS audio into STT)
 ```
+
+New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
+pieces link together in diagrams, and
+[docs/06-weights-and-biases.md](docs/06-weights-and-biases.md) explains the W&B Weave
+integration. The full explainer series lives in [docs/](docs/README.md).
+
+## Configuration
+
+Every knob lives in [`server/config.py`](server/config.py) with the tradeoff it
+controls commented beside it. The ones you'd actually toggle (all env vars; booleans
+accept `0`/`false`/`no` as off):
+
+| Area | Variable | Default | Meaning |
+|---|---|---|---|
+| Server | `PORT` | `8000` | HTTP/WebSocket port |
+| STT / latency | `STT_ENDPOINTING_MS` * | `300` | silence (ms) that ends a user turn — THE latency/accuracy dial |
+| Barge-in | `BARGE_IN_ON_VAD` | `1` | let a VAD speech onset pre-arm interruption (transcript still commits it) |
+| Barge-in | `BARGE_IN_VAD_GRACE_MS` | `250` | ignore VAD onsets this long after the agent starts speaking |
+| Images | `IMAGE_AUTOSEND_S` | `2.0` | a lone photo (no speech) auto-starts a turn after this many seconds |
+| Idle timeout | `IDLE_PROMPT_S` | `15` | silence before the "are you still there?" nudge |
+| Idle timeout | `IDLE_HANGUP_S` | `25` | further silence before goodbye + hang-up |
+| Weave | `WEAVE_ENABLED` | `1` | master switch for tracing (also off whenever `WANDB_API_KEY` is absent) |
+| Weave | `WEAVE_CAPTURE_MEDIA` | `1` | attach caller mic / reply audio / photo to each turn's trace |
+| Weave | `WANDB_ENTITY` | `wandb-smle` | W&B entity (team) the traces ship to |
+| Weave | `WANDB_PROJECT` | `jb_voice_deepgram_agent` | W&B project the traces ship to |
+| Vocal judge | `VOCAL_JUDGE_ENABLED` | `1` | per-turn acoustic frustration/fear verdict on the caller's mic audio |
+| Vocal judge | `VOCAL_JUDGE_MODEL` | `gpt-audio-mini` | OpenAI audio model doing the judging |
+| Vocal judge | `VOCAL_JUDGE_TIMEOUT_S` | `8.0` | judge deadline; on timeout the trace ships without vocal flags |
+
+\* `STT_ENDPOINTING_MS` is a constant in `config.py` (edit the file), not an env var —
+it's a product decision, not a deploy-time setting (see Production considerations §1).
 
 ## Architecture
 

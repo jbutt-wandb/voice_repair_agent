@@ -371,6 +371,11 @@ Session            = one weave.thread(session_id)   — groups every turn of a c
    └─ speak            inputs {text}                               one per spoken sentence
 ```
 
+(Since this was written, the `voice_turn` output also carries `vocal_frustrated` /
+`vocal_fearful` — an acoustic verdict on the caller's mic audio from an in-process
+judge, `server/vocal_judge.py`; [doc 06](06-weights-and-biases.md) explains why a
+server-side Weave monitor couldn't do that job.)
+
 Four design choices are worth stealing:
 
 - **The span tree is assembled at the *turn boundary*, not live inline.** A turn is
