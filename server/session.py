@@ -55,12 +55,14 @@ from openai import AsyncOpenAI
 
 from . import llm
 from .agent import build_system_prompt
+from .agent_lens import log_agent_turn
 from .config import (BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
                      CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
                      DEFAULT_IMAGE_PROMPT, IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S,
                      IDLE_PROMPT_PHRASE, IDLE_PROMPT_S, IMAGE_AUTOSEND_S,
                      IMAGE_FILLER_PHRASES, IMAGE_NOTE_REMINDER, LATENCY_LOG_DIR,
-                     MIN_SENTENCE_CHARS, VOCAL_JUDGE_ENABLED)
+                     MIN_SENTENCE_CHARS, STT_SAMPLE_RATE, TTS_SAMPLE_RATE,
+                     VOCAL_JUDGE_ENABLED)
 from .stt import DeepgramSTT, SpeechStarted, Transcript, UtteranceEnd
 from .tts import AudioChunk, Cleared, DeepgramTTS, Flushed
 from .vocal_judge import classify_vocal
@@ -746,6 +748,15 @@ class Session:
         self.trace.finish_turn(tt, assistant_text=assistant_text,
                                interrupted=interrupted, ended=ended,
                                metrics=metrics, vocal=vocal)
+        # Mirror the turn into the Agents view (Agent Lens) — a separate span store,
+        # so the voice_turn trace above is unaffected. Sync network I/O inside, so it
+        # runs on a worker thread, never the event loop.
+        if self.trace.enabled:
+            await asyncio.to_thread(
+                log_agent_turn, session_id=self.session_id, tt=tt,
+                assistant_text=assistant_text, interrupted=interrupted, ended=ended,
+                metrics=metrics, system_prompt=str(self.messages[0]["content"]),
+                stt_rate=STT_SAMPLE_RATE, tts_rate=TTS_SAMPLE_RATE)
 
     def _mark_activity(self) -> None:
         """Any real user input (speech, typing, a photo) resets the inactivity

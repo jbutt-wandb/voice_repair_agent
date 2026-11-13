@@ -140,3 +140,12 @@ WEAVE_CAPTURE_MEDIA = os.environ.get("WEAVE_CAPTURE_MEDIA", "1").lower() not in 
 VOCAL_JUDGE_ENABLED = os.environ.get("VOCAL_JUDGE_ENABLED", "1").lower() not in ("0", "false", "no")
 VOCAL_JUDGE_MODEL = os.environ.get("VOCAL_JUDGE_MODEL", "gpt-audio-mini")
 VOCAL_JUDGE_TIMEOUT_S = float(os.environ.get("VOCAL_JUDGE_TIMEOUT_S", "8.0"))
+
+# ---------------------------------------------------------------- Agent Lens
+# Emit each finished voice turn to the Forge Agents view (Agent Lens) as a
+# conversation turn with audio bubbles — a SEPARATE store from the Weave call
+# traces, correlated by conversation_id == session_id. See server/agent_lens.py.
+# Runs in a worker thread from the post-turn background task; off the hot path.
+AGENT_LENS_ENABLED = os.environ.get("AGENT_LENS_ENABLED", "1").lower() not in ("0", "false", "no")
+AGENT_NAME = os.environ.get("AGENT_NAME", "repair-agent")
+AGENT_VERSION = os.environ.get("AGENT_VERSION", "dev")
