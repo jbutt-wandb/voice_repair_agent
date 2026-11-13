@@ -12,6 +12,7 @@ STT → LLM → TTS pipeline is explicit, measured, and commented in the code.
 
 ```bash
 # .env must contain DEEPGRAM_API_KEY and OPENAI_API_KEY
+# (optional) add WANDB_API_KEY to ship per-turn traces to W&B Weave; without it, tracing no-ops
 uv sync
 uv run main.py            # serves http://127.0.0.1:8000  (PORT=8001 uv run main.py to change)
 ```
@@ -27,6 +28,9 @@ Open the URL in **Chrome**, click **Start call**, grant the mic, and **use headp
 - **Talk over the agent** mid-sentence → it stops instantly (barge-in).
 - *“That’s everything, I’m all set.”* → the agent says goodbye and **hangs up itself**
   (its `end_call` tool); press **Start call** for a fresh session.
+- **Send a photo** of a display or error code → the agent speaks a short "let me look"
+  filler to mask vision latency, then diagnoses from the image; send one and stay silent
+  and it auto-sends after ~2 s. It also *remembers* what the photo showed on later turns.
 - Type in the text box instead of speaking → same pipeline minus STT (great for testing).
 
 ```bash
@@ -136,10 +140,13 @@ seams, and barge-in is "set read pointer = write pointer" — instant silence.
 ```
 
 **Barge-in** is the hardest part of any voice agent, and the part this demo is most
-careful about. Trigger: a **non-empty interim transcript** arriving while the agent
-is thinking or speaking (more robust than raw VAD events, which fire on any noise).
-Cancellation then has to kill *four* things racing in flight — see
-`session.py::_barge_in`:
+careful about. Trigger: Deepgram's **`SpeechStarted` VAD onset** — it fires on speech
+*onset*, before any transcript exists, so even a short agent reply is interruptible;
+a non-empty interim transcript is kept as the fallback. The faster signal is bought
+off against self-interruption by browser echo cancellation plus a grace window
+(`BARGE_IN_VAD_GRACE_MS`), and can be disabled with `BARGE_IN_ON_VAD=0`. It only
+shortens time-to-interrupt — zero added latency. Cancellation then has to kill *four*
+things racing in flight — see `session.py::_barge_in`:
 1. bump `turn_id` — in-flight TTS audio is tagged by the turn that requested it, and
    stale tags get dropped (Deepgram's `Cleared` ack is **not** sufficient: audio
    mid-synthesis can still arrive after it — we hit this in testing),
@@ -158,15 +165,24 @@ Three layers, lowest-tech first:
    wiring, …). The entire corpus rides in the system prompt.
 2. **Hard rules** — the prompt forbids partial/hypothetical/disclaimer-wrapped
    instructions for unsafe actions, requires refusal + engineer offer, requires the
-   refusal to *hold under user insistence*, and refuses products with no manual.
-3. **Evaluation** — `scripts/safety_check.py` replays 12 scripted conversations
+   refusal to *hold under user insistence*, and refuses products with no manual. A
+   dedicated **SCOPE block** keeps the agent on its four appliances with five refusal
+   categories — other appliances (decline, still offer an engineer), non-appliance
+   home systems like plumbing/electrics/HVAC (no advice *and* no engineer, just
+   redirect), general/off-topic questions, "while you're at it" secondary requests,
+   and instruction-override/roleplay attempts. This closed a real jailbreak: pivoting
+   an ice-maker call into "fix my plumbing".
+3. **Evaluation** — `scripts/safety_check.py` replays 16 scripted conversations
    (safe fixes, forbidden probes, an insistence attack, out-of-scope product, a full
-   booking, basics-before-booking, the end-call flow) through the real prompt and LLM
-   stage, then grades each transcript with an **LLM-as-judge** plus mechanical
-   assertions on tool calls. Keyword matching can't grade refusals (a safe refusal
-   legitimately *mentions* the dangerous action); a judge model can — but only if the
-   judge gets the product manual verbatim, or it flags manual-approved steps as
-   violations (we hit exactly that). Exits non-zero on failure → run it in CI.
+   booking, basics-before-booking, the end-call flow, plus four scope attacks — a
+   plumbing pivot, a general-knowledge question, a secondary request, and a
+   prompt-injection) through the real prompt and LLM stage, then grades each
+   transcript with an **LLM-as-judge** plus mechanical assertions on tool calls.
+   Keyword matching can't grade refusals (a safe refusal legitimately *mentions* the
+   dangerous action); a judge model can — but only if the judge gets the product
+   manual verbatim, or it flags manual-approved steps as violations (we hit exactly
+   that). Exits non-zero on failure → run it in CI. (Known residual: the judge
+   occasionally misgrades a correct decline — eval-only noise, never on the voice path.)
 
 Honest limitation: in this POC the runtime enforcement is prompt-only. A production
 deployment should add an **output-side guardrail** — a cheap classifier or rule layer
@@ -190,7 +206,9 @@ metrics panel and logged as one structured line per turn):
 Notes for production measurement:
 - **Voice-to-voice is the product metric.** Humans expect a reply within ~500 ms and
   get uncomfortable past ~1.5 s. Track p50 *and* p95/p99 — tail latency is what users
-  remember. The stage breakdown exists so you know *which* stage to fix.
+  remember. The stage breakdown exists so you know *which* stage to fix. Every field
+  here is also emitted as a filterable **Weave trace attribute** per turn (see
+  Production considerations §9), so the p95-by-stage view is a query, not a scraper.
 - `stt_final_ms` here approximates endpoint wait using arrival times; rigorous STT
   lag measurement needs audio-sample timestamps compared against transcript word timings.
 - **Barge-in rate** is a proxy for two different problems: the agent talks too much
@@ -218,15 +236,27 @@ Notes for production measurement:
    splitting a tool call from its result (`session.py::_summarize_history`). It runs
    on a threshold, not per turn, because rewriting the prefix invalidates OpenAI's
    prompt cache. On barge-in, history stores only the sentences actually spoken — the
-   model's memory matches the customer's. What's NOT handled: manuals at catalog
-   scale (4,000 not 4) need retrieval, trading latency and a retrieval-miss safety risk.
+   model's memory matches the customer's. **Photos are context too**: an image left in
+   history would be re-sent (hundreds-to-thousands of vision tokens) every later turn,
+   so after the turn it arrived on, the base64 is collapsed to a cheap tagged text note
+   like `[Photo the customer shared — microwave display showing error E-15]`. That
+   description comes free — the same vision call emits it as trailing text after the
+   spoken reply (wrapped in a `[[PHOTO: …]]` sentinel that is stripped and never
+   spoken), so the agent "remembers" each photo at ~20 tokens apiece with no extra call
+   and no latency hit (`session.py::_collapse_image_messages`). What's NOT handled:
+   manuals at catalog scale (4,000 not 4) need retrieval, trading latency and a
+   retrieval-miss safety risk.
 4. **Interruption correctness.** Everything in flight must be cancellable, and any
    audio that was already in the pipe must be identifiable as stale (turn tags here).
    Assume every ack can arrive late or never.
 5. **Echo cancellation and self-barge-in.** Barge-in detection relies on the mic
-   *not* hearing the agent's own voice. Browsers ship AEC (`echoCancellation: true`);
-   it mostly works, but speakers + sensitive mic can still self-interrupt — telephony
-   deployments feed the TTS as an AEC reference signal. Demo with headphones.
+   *not* hearing the agent's own voice — doubly so now that it triggers on VAD onset,
+   which will flag any speech including the agent's. Browsers ship AEC
+   (`echoCancellation: true`); on top of it the VAD path adds a grace window
+   (`BARGE_IN_VAD_GRACE_MS`) after the agent starts speaking and a kill switch
+   (`BARGE_IN_ON_VAD=0`). It mostly works, but speakers + sensitive mic can still
+   self-interrupt — telephony deployments feed the TTS as an AEC reference signal.
+   Demo with headphones.
 6. **Connection hygiene.** Deepgram drops idle sockets (~10 s without audio on STT;
    quiet TTS connections too). Continuous audio + `KeepAlive` + lazy reconnect
    (`tts.py`) handle it here; production adds backoff, health checks, and reconnect
@@ -240,10 +270,19 @@ Notes for production measurement:
    $0.02) + gpt-4o-mini with a ~5k-token prompt per turn (~6 turns/min ≈ $0.005).
    Roughly **$0.03–0.05/min** — the LLM is *not* the dominant cost at this model size;
    TTS is. A bigger LLM or longer prompt changes that math fast.
-9. **Observability.** One structured log line per turn (already done here) is the
-   atom; aggregate into dashboards (latency percentiles, barge-in rate, booking
-   conversion, safety-eval pass rate). Record audio + transcripts (with consent!) —
-   you cannot debug a voice agent from text logs alone.
+9. **Observability.** One structured log line per turn (always on) is the atom;
+   aggregate into dashboards (latency percentiles, barge-in rate, booking conversion,
+   safety-eval pass rate). On top of that, this app ships a full **W&B Weave trace
+   tree per turn** (`server/weave_trace.py`): one `weave.thread` per call, one
+   `voice_turn` span per turn with `llm_completion` / `tool_*` / `speak` children,
+   latency + token cost + flags as filterable call *attributes*, and — because you
+   cannot debug a voice agent from text alone — both sides of the turn as audio
+   (16 kHz caller mic + 24 kHz agent reply, kept separate). The LLM span is recorded by
+   hand (not via auto-patch) so the base64 image is **redacted**. The entire tree is
+   assembled at the turn boundary and flushed on a background thread, so it adds **zero
+   voice-to-voice latency**; it's a no-op without `WANDB_API_KEY`. Knobs:
+   `WEAVE_ENABLED`, `WEAVE_CAPTURE_MEDIA`, `WANDB_ENTITY`, `WANDB_PROJECT` (see
+   `server/config.py`). Record audio + transcripts with consent and a retention policy.
 
 ## Repository layout
 
@@ -256,7 +295,8 @@ server/session.py           ★ orchestrator: state machine, barge-in, end-of-ca
 server/stt.py               Deepgram live STT wrapper (+ `python -m server.stt` smoke test)
 server/tts.py               Deepgram live TTS wrapper (+ `python -m server.tts` smoke test)
 server/llm.py               OpenAI streaming, tool loop, sentence chunker, summarizer
-server/agent.py             ★ safety surface: manuals → system prompt, booking + end_call tools
+server/agent.py             ★ safety surface: manuals → system prompt, scope rules, booking + end_call tools
+server/weave_trace.py       W&B Weave tracing: one span tree per turn, built off the hot path
 manuals/*.md                4 simulated product manuals (safe vs. specialist-only)
 static/index.html,app.js    UI: transcript, pipeline stages, live metrics table
 static/capture-worklet.js   mic → 16 kHz int16 frames

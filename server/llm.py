@@ -21,6 +21,7 @@ from openai import AsyncOpenAI
 
 from . import agent
 from .config import LLM_MAX_TOKENS, LLM_MODEL, LLM_TEMPERATURE
+from .weave_trace import suppress_autotrace
 
 
 @dataclass
@@ -37,7 +38,9 @@ class ToolCalled:
 
 @dataclass
 class Done:
-    pass
+    # Token usage summed across the turn's LLM pass(es). None if the provider
+    # didn't return it. Consumed by the observability layer (see weave_trace).
+    usage: dict | None = None
 
 
 async def agent_reply(client: AsyncOpenAI, messages: list[dict], *,
@@ -51,40 +54,56 @@ async def agent_reply(client: AsyncOpenAI, messages: list[dict], *,
       pass 2: model streams the spoken confirmation that references the result.
     The `while` handles the (rare) case of the model chaining more than one call.
     """
+    # Accumulate token usage across every pass of the tool loop (one usage chunk
+    # arrives per stream when include_usage is set) so the turn reports a single total.
+    usage_total: dict | None = None
     while True:
-        stream = await client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            tools=agent.TOOLS,
-            temperature=temperature,
-            max_tokens=LLM_MAX_TOKENS,
-            stream=True,
-        )
-        content_parts: list[str] = []
-        # Tool-call arguments arrive as JSON *fragments* spread across many deltas,
-        # keyed by index; they must be accumulated before they can be parsed.
-        tool_calls: dict[int, dict] = {}
-        try:
-            async for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    content_parts.append(delta.content)
-                    yield TextDelta(delta.content)
-                for tc in delta.tool_calls or []:
-                    acc = tool_calls.setdefault(
-                        tc.index, {"id": "", "name": "", "arguments": ""})
-                    if tc.id:
-                        acc["id"] = tc.id
-                    if tc.function and tc.function.name:
-                        acc["name"] = tc.function.name
-                    if tc.function and tc.function.arguments:
-                        acc["arguments"] += tc.function.arguments
-        finally:
-            # On barge-in the session cancels us mid-stream; closing the HTTP
-            # stream stops OpenAI from generating (and billing) further tokens.
-            await stream.close()
+        # suppress_autotrace: Weave records this LLM call via our own redacted span
+        # (see weave_trace.finish_turn), so the client's auto-patch span is suppressed
+        # here to avoid a duplicate that would also carry the raw image base64.
+        with suppress_autotrace():
+            stream = await client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=messages,
+                tools=agent.TOOLS,
+                temperature=temperature,
+                max_tokens=LLM_MAX_TOKENS,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            content_parts: list[str] = []
+            # Tool-call arguments arrive as JSON *fragments* spread across many deltas,
+            # keyed by index; they must be accumulated before they can be parsed.
+            tool_calls: dict[int, dict] = {}
+            try:
+                async for chunk in stream:
+                    if chunk.usage is not None:
+                        # Final (usage) chunk carries no choices; fold it in and move on.
+                        usage_total = _add_usage(usage_total, chunk.usage)
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    if delta.content:
+                        content_parts.append(delta.content)
+                        yield TextDelta(delta.content)
+                    for tc in delta.tool_calls or []:
+                        acc = tool_calls.setdefault(
+                            tc.index, {"id": "", "name": "", "arguments": ""})
+                        if tc.id:
+                            acc["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            acc["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            acc["arguments"] += tc.function.arguments
+            finally:
+                # On barge-in the session cancels us mid-stream; closing the HTTP
+                # stream stops OpenAI generating (and billing) further tokens. Guard the
+                # close so a cleanup hiccup can't mask the real error that unwound us
+                # here (e.g. a consumer exception thrown in at a yield point); on normal
+                # completion the stream is already closed and close() returns None.
+                closer = stream.close()
+                if closer is not None:
+                    await closer
 
         content = "".join(content_parts)
         if not tool_calls:
@@ -113,7 +132,15 @@ async def agent_reply(client: AsyncOpenAI, messages: list[dict], *,
                 "content": json.dumps(result),
             })
 
-    yield Done()
+    yield Done(usage=usage_total)
+
+
+def _add_usage(total: dict | None, usage) -> dict:
+    """Fold one OpenAI usage object into the running per-turn total."""
+    total = total or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for field in total:
+        total[field] += getattr(usage, field, 0) or 0
+    return total
 
 
 SUMMARIZER_PROMPT = """\
@@ -123,6 +150,9 @@ matter later; drop all chit-chat and wording. Always keep:
 - the product and the reported symptoms
 - every troubleshooting step already tried and its outcome (so nothing is repeated)
 - anything the customer was asked to check and their answers (power, lights, error codes)
+- anything shown in a photo the customer shared (these appear as "[Photo the customer
+  shared — ...]" notes in the transcript); keep the described details verbatim enough that
+  the agent still knows what the photo showed
 - any safety refusals already given
 - booking details if an engineer was booked (date, time window, reference)
 - customer preferences, constraints, names, dates

@@ -4,6 +4,17 @@ tuning a production voice agent — the README explains the tradeoff behind each
 import os
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env as early as possible, from the project root, so EVERY entry point sees the
+# keys — not just `uv run main.py`. The live server is launched as `uvicorn server.app:app`,
+# which never runs main.py; without this, WANDB_API_KEY (and any env override below) would
+# be missing in the uvicorn process and Weave tracing would silently no-op. config is the
+# earliest common import (session.py and weave_trace.py both import it) and runs before
+# init_weave() reads WANDB_API_KEY, so loading here covers the whole process. load_dotenv
+# is idempotent and never overrides already-set vars, so main.py calling it too is harmless.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 # ---------------------------------------------------------------- speech-to-text
 STT_MODEL = "nova-3"          # Deepgram's streaming STT model
 STT_SAMPLE_RATE = 16000       # browser downsamples mic to this; 16 kHz is plenty for speech
@@ -14,6 +25,25 @@ STT_ENDPOINTING_MS = 300
 # Fallback end-of-turn signal: if no speech_final arrives (e.g. endpointing missed),
 # Deepgram emits UtteranceEnd after this much silence between finalized words.
 STT_UTTERANCE_END_MS = 1000
+
+# ---------------------------------------------------------------- barge-in
+# What interrupts the agent when the caller speaks over it. A barge-in is ALWAYS
+# committed by a recognized, non-empty user TRANSCRIPT — never by a raw VAD onset
+# alone. Deepgram's VAD SpeechStarted fires on speech ONSET (before any transcript),
+# but it also fires on the agent's own greeting echoing back through the speakers or on
+# room noise, so trusting it on its own made the agent interrupt ITSELF while the user
+# was silent. Instead, when BARGE_IN_ON_VAD is on, a VAD onset only "pre-arms"
+# (records that speech energy was seen) and the next real transcript commits the
+# interrupt — echo cancellation (static/app.js) keeps the agent's own voice from
+# producing confident transcript words, so silence can never self-interrupt. Set to 0
+# to ignore VAD onsets entirely (pure transcript-triggered barge-in); either way the
+# transcript is the trigger, so the DEFAULT is safe.
+BARGE_IN_ON_VAD = os.environ.get("BARGE_IN_ON_VAD", "1").lower() not in ("0", "false", "no")
+# Grace window (ms) after the agent starts SPEAKING before a VAD onset may pre-arm a
+# barge-in. Belt-and-braces: suppresses noisy pre-arming during the echo-cancellation
+# ramp-up at speech onset. (Correctness no longer depends on this — a VAD onset can't
+# interrupt on its own regardless — it only reduces spurious pre-arm bookkeeping.)
+BARGE_IN_VAD_GRACE_MS = float(os.environ.get("BARGE_IN_VAD_GRACE_MS", "250"))
 
 # ---------------------------------------------------------------- language model
 LLM_MODEL = "gpt-4o-mini"     # low-latency, cheap; voice agents live and die on TTFT
@@ -48,6 +78,27 @@ IMAGE_FILLER_PHRASES = (
     "Okay, let me see that.",
 )
 
+# ---------------------------------------------------------------- image auto-send
+# A photo normally rides on the NEXT user turn (the caller sends a picture, then
+# says "what's this?"). But if the caller just sends a photo and stays silent, we
+# shouldn't wait forever: after this many seconds with a photo pending and no speech,
+# auto-start a turn that feeds the image to the LLM on its own. The LLM message is the
+# image followed by DEFAULT_IMAGE_PROMPT (image FIRST — the ordering that makes the
+# vision model reliably look before it answers). Env-overridable for fast tests.
+IMAGE_AUTOSEND_S = float(os.environ.get("IMAGE_AUTOSEND_S", "2.0"))
+DEFAULT_IMAGE_PROMPT = os.environ.get(
+    "DEFAULT_IMAGE_PROMPT", "(The customer shared this photo — take a look.)")
+# Attached as an extra text part on the image message (same multimodal vision call — no
+# extra LLM round-trip) to reliably elicit the silent photo note. gpt-4o-mini follows a
+# reminder adjacent to the image far more consistently than the system prompt alone. It is
+# model INPUT only (never spoken) and is dropped when the image message is collapsed
+# (collapse keeps only the first text part — the customer's words).
+IMAGE_NOTE_REMINDER = (
+    "(System reminder: a photo is attached to THIS turn. After your short spoken reply, you "
+    "MUST append the silent photo note as the very last thing, in exactly this form: "
+    "[[PHOTO: one-line factual description of what is visible]]. Never skip it on a photo "
+    "turn and never speak it aloud.)")
+
 # ---------------------------------------------------------------- inactivity timeout
 # A silent (abandoned) call shouldn't stay open forever burning STT/TTS minutes.
 # After IDLE_PROMPT_S of silence the agent nudges once ("are you still there?"); if
@@ -66,3 +117,15 @@ SERVER_PORT = int(os.environ.get("PORT", "8000"))
 # Each session's per-turn + aggregate latency is written here as a timestamped JSON
 # on teardown (see server/session.py::_write_latency_log). Gitignored.
 LATENCY_LOG_DIR = Path(__file__).resolve().parent.parent / "session_logs"
+
+# ---------------------------------------------------------------- Weave tracing
+# Rich per-turn traces (transcript, latency, tool use, media) shipped to W&B Weave
+# for reviewing completed conversations. See server/weave_trace.py. Tracing is
+# built ENTIRELY at the turn boundary (off the voice hot path) and degrades to a
+# no-op when WANDB_API_KEY is missing, so it never affects the live call.
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "wandb-smle")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "jb_voice_deepgram_agent")
+# Master switch (env "0"/"false" to disable even when a key is present).
+WEAVE_ENABLED = os.environ.get("WEAVE_ENABLED", "1").lower() not in ("0", "false", "no")
+# Whether to attach the caller's photo and recorded utterance audio to each turn.
+WEAVE_CAPTURE_MEDIA = os.environ.get("WEAVE_CAPTURE_MEDIA", "1").lower() not in ("0", "false", "no")

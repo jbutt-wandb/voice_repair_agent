@@ -44,8 +44,10 @@ import json
 import logging
 import os
 import random
+import re
 import statistics
 import time
+import uuid
 from dataclasses import asdict, dataclass
 
 from fastapi import WebSocket
@@ -53,12 +55,15 @@ from openai import AsyncOpenAI
 
 from . import llm
 from .agent import build_system_prompt
-from .config import (CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
-                     IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S, IDLE_PROMPT_PHRASE,
-                     IDLE_PROMPT_S, IMAGE_FILLER_PHRASES, LATENCY_LOG_DIR,
+from .config import (BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
+                     CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
+                     DEFAULT_IMAGE_PROMPT, IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S,
+                     IDLE_PROMPT_PHRASE, IDLE_PROMPT_S, IMAGE_AUTOSEND_S,
+                     IMAGE_FILLER_PHRASES, IMAGE_NOTE_REMINDER, LATENCY_LOG_DIR,
                      MIN_SENTENCE_CHARS)
 from .stt import DeepgramSTT, SpeechStarted, Transcript, UtteranceEnd
 from .tts import AudioChunk, Cleared, DeepgramTTS, Flushed
+from .weave_trace import SessionTracer
 
 log = logging.getLogger("session")
 
@@ -75,6 +80,53 @@ def _p95(values: list[float]) -> float:
 
 GREETING = ("Hi, you're through to HomeFix Appliances repair support, this is Alex. "
             "Which appliance can I help you with today?")
+
+# ---------------------------------------------------------------- photo-memory sentinel
+# On an image turn the model appends a silent, content-labelled description of the photo
+# wrapped in this marker AFTER its spoken reply (see agent.build_system_prompt). The
+# description is kept in history as cheap text (so the base64 is never resent) while the
+# marker itself is NEVER spoken. The sentinel is a token sequence the model won't utter
+# naturally, so detecting it is unambiguous.
+_PHOTO_OPEN = "[["
+# Pull "<description>" out of a complete [[PHOTO: <description>]] marker...
+_PHOTO_NOTE_RE = re.compile(r"\[\[\s*PHOTO\s*:\s*(.*?)\s*\]\]", re.IGNORECASE | re.DOTALL)
+# ...or out of an unterminated one (model hit max_tokens before closing ]]).
+_PHOTO_NOTE_OPEN_RE = re.compile(r"\[\[\s*PHOTO\s*:\s*(.*)$", re.IGNORECASE | re.DOTALL)
+# Hard guard: strip any complete [[...]] marker, then any dangling [[... tail, so nothing
+# containing "[[" can ever reach TTS even if the model formats the note oddly.
+_SENTINEL_STRIP_RE = re.compile(r"\[\[.*?\]\]", re.DOTALL)
+_SENTINEL_TAIL_RE = re.compile(r"\[\[.*$", re.DOTALL)
+
+
+def _strip_sentinel(text: str) -> str:
+    """Remove any photo-note sentinel (complete or dangling) from text bound for TTS.
+    Belt-and-braces: the streaming loop already stops feeding at the sentinel, but this
+    guarantees no "[[" ever reaches the speaker or spoken_sentences."""
+    text = _SENTINEL_STRIP_RE.sub("", text)
+    text = _SENTINEL_TAIL_RE.sub("", text)
+    return text
+
+
+def _speakable_prefix_len(buf: str) -> int:
+    """Index up to which `buf` is safe to speak: everything before the first sentinel
+    marker. If no marker has appeared yet, hold back a lone trailing '[' (it could be
+    the first half of a '[[' arriving split across deltas)."""
+    idx = buf.find(_PHOTO_OPEN)
+    if idx != -1:
+        return idx
+    if buf.endswith("["):
+        return len(buf) - 1
+    return len(buf)
+
+
+def _extract_photo_note(buf: str) -> str | None:
+    """Pull the content-labelled description out of a [[PHOTO: ...]] marker in `buf`
+    (tolerating an unterminated marker). Returns None if no marker is present."""
+    m = _PHOTO_NOTE_RE.search(buf) or _PHOTO_NOTE_OPEN_RE.search(buf)
+    if not m:
+        return None
+    note = m.group(1).strip()
+    return note or None
 
 
 class State(enum.Enum):
@@ -108,6 +160,11 @@ class Session:
         self.utterance_parts: list[str] = []  # finalized STT fragments of the current user turn
         # A photo the user sent, waiting to ride on the next user turn (then cleared).
         self.pending_image: str | None = None
+        # Content-labelled descriptions captured from the model's [[PHOTO: ...]] note on an
+        # image turn, keyed by id() of the image-bearing user message. Consumed (popped) by
+        # _collapse_image_messages so the collapsed note carries what the photo showed —
+        # the photo's information survives in cheap text without resending the base64.
+        self._image_descriptions: dict[int, str] = {}
         self.agent_task: asyncio.Task | None = None
         self.summarize_task: asyncio.Task | None = None  # background context compression
         self.close_task: asyncio.Task | None = None      # delayed hang-up after end_call
@@ -136,6 +193,13 @@ class Session:
         self.t_first_speak: float | None = None  # first REAL speak; reset per turn
         self.has_filler = False                  # image-turn filler spoken this turn?
         self.total_barge_ins = 0
+        # VAD barge-in is TRANSCRIPT-confirmed: a SpeechStarted (VAD onset) only "pre-arms"
+        # (records that speech energy was seen); it never interrupts on its own. The actual
+        # interrupt is committed by a recognized, non-empty transcript. This guarantees the
+        # agent can NEVER barge-in on its own greeting/echo or room noise while the user is
+        # silent. See _stt_rx (SpeechStarted branch) and _vad_barge_in_allowed.
+        self._vad_pre_armed = False
+        self._t_vad_pre_arm = 0.0
 
         # Per-session latency record, flushed to a JSON file on teardown.
         self.started_at = datetime.datetime.now(datetime.timezone.utc)
@@ -146,6 +210,25 @@ class Session:
         self.idle_stage = 0          # 0 normal, 1 nudged ("are you still there?"), 2 ending
         self.t_nudge = 0.0
         self.idle_turn = False       # the current scripted turn is a nudge/goodbye
+
+        # Weave tracing: one thread per session, one span tree per turn (see
+        # weave_trace.py). All no-ops when tracing is disabled.
+        self.session_id = uuid.uuid4().hex
+        self.trace = SessionTracer(self.session_id)
+        self.tt = None                      # current turn's trace accumulator (or None)
+        # Rolling buffer of this turn's mic PCM, snapshotted as the turn's user audio.
+        self._mic_buf = bytearray()
+        # Agent-audio capture for the trace, filled from the TTS output in _tts_rx and
+        # split into two streams: the model reply (-> voice_turn.tts_audio) and any canned
+        # speech (greeting / filler / idle -> that system_utterance's audio).
+        self._tts_buf = bytearray()         # current turn's REAL reply audio (24 kHz PCM)
+        self._sys_tts_buf = bytearray()     # current canned-utterance audio (24 kHz PCM)
+        # A canned utterance whose audio we're capturing, emitted (with its audio) at the
+        # turn boundary rather than up-front, so the system_utterance op carries sound.
+        self._pending_sys_utt: tuple[str, str] | None = None
+
+        # Auto-send a lone photo after IMAGE_AUTOSEND_S of silence (see _arm_image_autosend).
+        self._image_autosend_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -169,7 +252,8 @@ class Session:
                     if t.exception():
                         log.error("task %s failed", t.get_name(), exc_info=t.exception())
             finally:
-                for extra in (self.agent_task, self.summarize_task, self.close_task):
+                for extra in (self.agent_task, self.summarize_task, self.close_task,
+                              self._image_autosend_task):
                     if extra:
                         extra.cancel()
                 for t in tasks:
@@ -198,17 +282,23 @@ class Session:
                 return
             if msg.get("bytes"):
                 # Mic frame. Forwarded unconditionally — see module docstring.
+                if self.trace.capture_media:
+                    # Retain the raw PCM so the turn's utterance can be attached to its
+                    # trace; snapshotted and cleared at end-of-turn (see _snapshot_mic).
+                    self._mic_buf.extend(msg["bytes"])
                 await self.stt.send_audio(msg["bytes"])
             elif msg.get("text"):
                 data = json.loads(msg["text"])
                 if data["type"] == "text_input":
                     await self._on_text_input(data["text"])
                 elif data["type"] == "image":
-                    # A photo. Hold it until the next user turn, which will send it
-                    # to the (multimodal) LLM alongside the user's words.
+                    # A photo. Normally it rides on the NEXT user turn, sent to the
+                    # (multimodal) LLM alongside the user's words. But if the caller stays
+                    # silent, _arm_image_autosend fires it on its own after a short wait.
                     self._mark_activity()
                     self.pending_image = data["data"]
                     await self._send({"type": "image_received"})
+                    self._arm_image_autosend()
                 elif data["type"] == "playback_started":
                     # First TTS sample is audible. Refine voice-to-voice with the
                     # real number the user experienced (localhost: network ~0).
@@ -224,8 +314,17 @@ class Session:
                 if not event.text.strip():
                     continue  # silence / empty results
                 self._mark_activity()  # real speech resets the inactivity watchdog
-                # ANY real speech while the agent is thinking or speaking = barge-in.
+                # The caller is speaking: a pending photo will ride WITH their words on
+                # this turn, so cancel the "lone photo" auto-send countdown.
+                self._cancel_image_autosend()
+                # ANY real, recognized speech while the agent is thinking or speaking =
+                # barge-in. THIS is the only thing that commits an interrupt — a non-empty
+                # transcript proves it's the user, not the agent's own echo or room noise
+                # (which may still have pre-armed VAD above but can never fire on its own).
                 if self.state is not State.LISTENING:
+                    if self._vad_pre_armed:
+                        log.info("barge-in confirmed by transcript (VAD pre-armed %d ms earlier)",
+                                 round((time.monotonic() - self._t_vad_pre_arm) * 1000))
                     await self._barge_in()
                 if not event.speech_final:
                     # Timestamp of the last transcript BEFORE the endpoint decision,
@@ -247,7 +346,24 @@ class Session:
                     log.info("end-of-turn via UtteranceEnd fallback")
                     await self._end_of_user_turn()
             elif isinstance(event, SpeechStarted):
-                pass  # VAD onset; too noise-prone to act on, but useful to log/plot
+                # VAD onset is the EARLIEST possible barge-in cue, but it fires on ANY
+                # sound energy — the agent's OWN greeting echoing back through the
+                # speakers (no headphones), or room noise — so it can NEVER be trusted to
+                # interrupt on its own. Doing so was the regression that made the agent
+                # barge-in on its own greeting with the user completely silent.
+                #
+                # So VAD only PRE-ARMS here; it never cancels anything. The interrupt is
+                # COMMITTED only by an actual recognized, non-empty user transcript (the
+                # Transcript branch above). Echo cancellation (static/app.js) suppresses
+                # the agent's own voice enough that STT won't produce confident words from
+                # it even while VAD energy fires — so "a real transcript appeared" is the
+                # discriminator that makes "silence can never self-interrupt" a hard
+                # guarantee. This costs the raw VAD-onset earliness (see README / report):
+                # we deliberately trade a few ms of snappiness for never self-interrupting.
+                if (self.state is not State.LISTENING
+                        and self._vad_barge_in_allowed()):
+                    self._vad_pre_armed = True
+                    self._t_vad_pre_arm = time.monotonic()
 
     async def _tts_rx(self) -> None:
         """Deepgram TTS output: audio to the browser + turn completion tracking."""
@@ -271,6 +387,18 @@ class Session:
                     now = time.monotonic()
                     self.metrics.tts_ttfb_ms = round((now - self.t_first_speak) * 1000)
                     self.metrics.v2v_server_ms = round((now - self.t_turn_end) * 1000)
+                # Capture the agent's audio for the trace, split into two streams. The
+                # filler (image turns) is spoken first and its Flushed ack lands before
+                # the real reply's first chunk — the same gate the TTFB metric uses — so
+                # flushed_received separates filler audio from the real reply. A scripted
+                # turn (greeting / idle) has no self.tt: all of its audio is canned.
+                if self.trace.capture_media:
+                    if self.has_filler and self.flushed_received == 0:
+                        self._sys_tts_buf.extend(event.data)         # image-turn filler
+                    elif self.tt is None and self._pending_sys_utt is not None:
+                        self._sys_tts_buf.extend(event.data)         # greeting / idle
+                    else:
+                        self._tts_buf.extend(event.data)             # real model reply
                 await self.ws.send_bytes(event.data)
             elif isinstance(event, Flushed):
                 if stale:
@@ -286,31 +414,40 @@ class Session:
         """Typed input from the UI's text box: bypasses STT but exercises the whole
         rest of the pipeline (LLM -> TTS -> playback). Invaluable for testing."""
         self._mark_activity()
+        self._cancel_image_autosend()  # typed turn will consume any pending photo
         if self.state is not State.LISTENING:
             await self._barge_in()
         self.t_last_transcript = time.monotonic()  # typed "speech" ends now
         self.utterance_parts = [text]
         await self._send({"type": "final_transcript", "text": text, "turn_id": self.turn_id})
-        await self._end_of_user_turn()
+        await self._end_of_user_turn(from_voice=False)
 
-    async def _end_of_user_turn(self) -> None:
+    async def _end_of_user_turn(self, from_voice: bool = True) -> None:
         # Defensive: if a prior image turn was cancelled by barge-in before it could
         # collapse, strip the lingering base64 now so it isn't resent.
         self._collapse_image_messages()
         user_text = " ".join(self.utterance_parts).strip()
         self.utterance_parts = []
+        # Always snapshot (and clear) the mic buffer so it can't grow unbounded; keep
+        # the audio only for spoken turns (a typed turn has no meaningful mic input).
+        audio = self._snapshot_mic()
         if not user_text:
             return
         now = time.monotonic()
         self.t_turn_end = now
-        self._begin_agent_turn(user_text=user_text)
+        self._begin_agent_turn(user_text=user_text,
+                               audio=audio if from_voice else None)
         # How long the endpointer made us wait after the last word (approximate:
         # true STT lag needs audio-sample timestamps, see README).
         self.metrics.stt_final_ms = round((now - self.t_last_transcript) * 1000)
 
     def _begin_agent_turn(self, user_text: str | None = None,
-                          scripted: str | None = None) -> None:
+                          scripted: str | None = None, *,
+                          audio: bytes | None = None, kind: str = "greeting",
+                          image_autosend: bool = False) -> None:
         """Common setup for a new agent turn (LLM-driven or scripted greeting)."""
+        # A turn is starting: any pending "lone photo" countdown is now moot.
+        self._cancel_image_autosend()
         self.turn_id += 1
         self.metrics = TurnMetrics(turn_id=self.turn_id)
         self.speaks_sent = self.flushes_sent = self.flushed_received = 0
@@ -318,14 +455,43 @@ class Session:
         self.spoken_sentences = []
         self.has_filler = False           # set True if an image-turn filler is spoken
         self.t_first_speak = None         # set on the first REAL (recorded) speak
-        coro = (self._scripted_turn(scripted, self.turn_id) if scripted
-                else self._agent_turn(user_text, self.turn_id))
+        self._vad_pre_armed = False       # fresh turn: no VAD onset seen yet
+        # Fresh agent-audio capture for this turn (see _tts_rx).
+        self._tts_buf.clear()
+        self._sys_tts_buf.clear()
+        self._pending_sys_utt = None
+        if scripted:
+            # Canned speech is not a model turn; no voice_turn trace. Its system_utterance
+            # op is emitted (with captured audio) at the turn boundary via _finish_agent_turn.
+            self.tt = None
+            coro = self._scripted_turn(scripted, self.turn_id, kind)
+        else:
+            # Open this turn's trace accumulator and attach its media (the photo is
+            # still pending here; it's consumed inside _agent_turn).
+            self.tt = self.trace.start_turn(self.turn_id, user_text or "")
+            if self.tt:
+                if self.pending_image:
+                    self.tt.set_image(self.pending_image)
+                self.tt.set_audio(audio)
+                self.tt.image_autosend = image_autosend
+            coro = self._agent_turn(user_text or "", self.turn_id)
         self.agent_task = asyncio.create_task(coro, name=f"agent_turn_{self.turn_id}")
+        self.agent_task.add_done_callback(self._log_turn_failure)
+
+    @staticmethod
+    def _log_turn_failure(task: asyncio.Task) -> None:
+        """Surface a crashed agent turn (its exception is otherwise never awaited)."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("agent turn %s crashed", task.get_name(), exc_info=exc)
 
     async def _agent_turn(self, user_text: str, turn_id: int) -> None:
         """One LLM-driven reply: stream tokens, chunk into sentences, feed TTS."""
         await self._set_state(State.THINKING)
         had_image = self.pending_image is not None  # capture before it's consumed below
+        image_msg: dict | None = None  # the image-bearing user message, for its photo note
         # If a photo is pending, send it to the multimodal LLM alongside the words as
         # a list of content parts; otherwise a plain string. Cleared once consumed —
         # and collapsed back to text after the turn (see _collapse_image_messages) so
@@ -334,12 +500,15 @@ class Session:
             # Image part FIRST, then text: gpt-4o-mini reliably "looks" before it
             # answers this way. Text-first lets it reply from the conversation persona
             # ("I'm on a voice call, I can't see images") and ignore the attachment.
+            # Parts order: image FIRST (so the vision model looks before answering), then the
+            # customer's words, then a silent reminder to append the photo note. The reminder
+            # is model INPUT only and is dropped at collapse (which keeps the FIRST text part).
             content = [{"type": "image_url", "image_url": {"url": self.pending_image}},
-                       {"type": "text",
-                        "text": user_text or "What do you see in this photo? Describe what's "
-                                             "relevant to my appliance."}]
+                       {"type": "text", "text": user_text or DEFAULT_IMAGE_PROMPT},
+                       {"type": "text", "text": IMAGE_NOTE_REMINDER}]
             self.pending_image = None
-            self.messages.append({"role": "user", "content": content})
+            image_msg = {"role": "user", "content": content}
+            self.messages.append(image_msg)
         else:
             self.messages.append({"role": "user", "content": user_text})
         # Image turns take ~1.8s for the vision model; speak a canned filler NOW to
@@ -348,33 +517,80 @@ class Session:
         # record=False keeps it out of spoken_sentences (barge-in "what was heard" memory).
         if had_image:
             self.has_filler = True
-            await self._speak(random.choice(IMAGE_FILLER_PHRASES), record=False)
+            if self.tt:
+                self.tt.filler_used = True
+            filler = random.choice(IMAGE_FILLER_PHRASES)
+            # Emit the filler's system_utterance at the turn boundary (with its captured
+            # audio), not now — its audio hasn't been synthesized yet. See _tts_rx routing.
+            self._pending_sys_utt = (filler, "filler")
+            await self._speak(filler, record=False)
+        # Snapshot the exact request the model sees (base64 redacted inside the tracer)
+        # for the turn's llm_completion child span.
+        if self.tt:
+            self.tt.set_request(self.messages)
+            self.tt.llm_start()
         chunker = llm.SentenceChunker(MIN_SENTENCE_CHARS)
         t_llm_start = time.monotonic()
+        # Raw model text accumulated across the turn, and how much of it has already been
+        # released to TTS/UI. Only the portion BEFORE the [[PHOTO: ...]] sentinel is ever
+        # released; the sentinel + description are captured silently as trailing generation
+        # (they arrive AFTER the full spoken reply, so first-sentence TTFT is unaffected).
+        raw_text = ""
+        released = 0
         try:
             async for event in llm.agent_reply(self.openai, self.messages):
                 if isinstance(event, llm.TextDelta):
                     if self.metrics.llm_ttft_ms is None:
                         self.metrics.llm_ttft_ms = round(
                             (time.monotonic() - t_llm_start) * 1000)
-                    await self._send({"type": "agent_text_delta", "text": event.text,
-                                      "turn_id": turn_id})
-                    for sentence in chunker.feed(event.text):
-                        await self._speak(sentence)
+                    raw_text += event.text
+                    safe_to = _speakable_prefix_len(raw_text)
+                    if safe_to > released:
+                        new_text = raw_text[released:safe_to]
+                        released = safe_to
+                        if self.tt:
+                            self.tt.add_reply(new_text)
+                        await self._send({"type": "agent_text_delta", "text": new_text,
+                                          "turn_id": turn_id})
+                        for sentence in chunker.feed(new_text):
+                            await self._speak(sentence)
+                    # Once the sentinel has appeared, everything after it is the silent
+                    # photo note — stop releasing text to TTS entirely.
                 elif isinstance(event, llm.ToolCalled):
                     if event.name == "end_call":
                         # The model decided the call is over; after the goodbye
                         # finishes flushing, _finish_agent_turn hangs up.
                         self.ending = True
+                    if self.tt:
+                        self.tt.add_tool(event.name, event.arguments, event.result)
                     await self._send({"type": "tool_call", "name": event.name,
                                       "args": event.arguments, "result": event.result,
                                       "turn_id": turn_id})
                 elif isinstance(event, llm.Done):
+                    if self.tt:
+                        self.tt.llm_end(event.usage)
+                    # Release any remaining non-sentinel text (recovers a legitimate lone
+                    # trailing '[' that we conservatively held back and that never became
+                    # a sentinel). Never releases anything at/after a real sentinel.
+                    if _PHOTO_OPEN not in raw_text and released < len(raw_text):
+                        tail = raw_text[released:]
+                        released = len(raw_text)
+                        if self.tt:
+                            self.tt.add_reply(tail)
+                        await self._send({"type": "agent_text_delta", "text": tail,
+                                          "turn_id": turn_id})
+                        for sentence in chunker.feed(tail):
+                            await self._speak(sentence)
                     remainder = chunker.flush()
                     if remainder:
                         await self._speak(remainder)
             await self._send({"type": "agent_text_done", "turn_id": turn_id,
                               "interrupted": False})
+            # Capture the silent photo note (if the model emitted one) and scrub the
+            # sentinel from the stored assistant message so the raw marker never lingers
+            # in history. The description is associated with THIS turn's image message and
+            # consumed when that message is collapsed to a cheap text note.
+            self._capture_photo_note(raw_text, image_msg)
             self.llm_done = True
             if self.speaks_sent == 0:
                 # Model produced no speakable text (shouldn't happen, but never
@@ -401,10 +617,13 @@ class Session:
                                   "interrupted": True})
             raise
 
-    async def _scripted_turn(self, text: str, turn_id: int) -> None:
+    async def _scripted_turn(self, text: str, turn_id: int, kind: str = "greeting") -> None:
         """Speak fixed text (the greeting) through the normal TTS path."""
         await self._set_state(State.THINKING)
         self.t_turn_end = time.monotonic()  # baseline so greeting metrics aren't nonsense
+        # Canned speech is traced as a system_utterance (distinct from model turns), emitted
+        # with its captured audio at the turn boundary (_finish_agent_turn / _barge_in).
+        self._pending_sys_utt = (text, kind)
         self.messages.append({"role": "assistant", "content": text})
         await self._send({"type": "agent_text_delta", "text": text, "turn_id": turn_id})
         await self._speak(text)
@@ -420,6 +639,13 @@ class Session:
         record=False is for the image-turn filler: it still plays and still counts
         toward flush accounting, but it's excluded from spoken_sentences so an
         interrupted turn doesn't "remember" the filler as something the model said."""
+        # HARD GUARD: never let a photo-note sentinel reach TTS or spoken_sentences, even
+        # if the model formatted it oddly. The streaming loop already withholds the
+        # sentinel; this is the last line of defense. If stripping leaves nothing speakable
+        # (the chunk was pure sentinel), drop it entirely — no Speak/Flush is sent.
+        sentence = _strip_sentinel(sentence)
+        if not sentence.strip():
+            return
         # t_first_speak marks the first REAL (recorded) sentence, so TTS TTFB measures
         # the real reply even when a non-recorded filler was spoken first.
         if record and self.t_first_speak is None:
@@ -427,6 +653,10 @@ class Session:
         self.tts_turn = self.turn_id  # tag the socket's output as ours
         if record:
             self.spoken_sentences.append(sentence)
+            # A spoken sentence of the real reply becomes a speak child of this turn.
+            # (The filler is record=False; scripted turns have no self.tt.)
+            if self.tt:
+                self.tt.add_speak(sentence)
         self.speaks_sent += 1
         self.flushes_sent += 1
         await self.tts.speak(sentence)
@@ -449,6 +679,16 @@ class Session:
         # The model has now seen any image this turn; drop the base64 from history so
         # it isn't resent on subsequent turns (keeps context — and cost — flat).
         self._collapse_image_messages()
+        # Emit any canned utterance (greeting / filler / idle) now, with its audio.
+        self._flush_system_utterance()
+        # Emit this turn's full Weave trace tree at the boundary (off the hot path),
+        # attaching the agent's spoken-reply audio captured in _tts_rx.
+        if self.tt:
+            self.tt.set_tts_audio(bytes(self._tts_buf))
+            self.trace.finish_turn(self.tt, assistant_text=self.tt.reply_text,
+                                   interrupted=False, ended=self.ending,
+                                   metrics=self.metrics)
+            self.tt = None
         if self.ending:
             # The agent said goodbye and all of its audio is flushed. Tell the client
             # to hang up once playback drains; close ourselves as a fallback in case
@@ -458,6 +698,10 @@ class Session:
             self.close_task = asyncio.create_task(self._close_after(15))
             return
         await self._set_state(State.LISTENING)
+        # A photo that arrived while the agent was busy (so its countdown never armed)
+        # now gets its chance: start the countdown now that we're idle again.
+        if self.pending_image:
+            self._arm_image_autosend()
         if not was_idle:
             # A real reply (or the greeting) just finished — restart the inactivity
             # window so the caller gets the full quiet period before being nudged.
@@ -475,6 +719,82 @@ class Session:
         self.t_last_activity = time.monotonic()
         self.idle_stage = 0
         self.idle_turn = False
+
+    def _vad_barge_in_allowed(self) -> bool:
+        """Guard for whether a VAD (SpeechStarted) onset may PRE-ARM a barge-in.
+
+        Note: a VAD onset never interrupts on its own anymore (that was the
+        self-interrupt regression) — it only pre-arms, and a real transcript commits
+        the interrupt. This guard therefore just suppresses noisy pre-arming during the
+        echo-cancellation ramp-up at the very start of a reply; it has no effect on
+        correctness (silence can't self-interrupt regardless, because no transcript
+        confirms it). The primary defense remains browser echo cancellation
+        (static/app.js getUserMedia). While THINKING (no agent audio yet) there is
+        nothing to echo, so onset pre-arms immediately."""
+        if not BARGE_IN_ON_VAD:
+            return False
+        if self.state is State.SPEAKING and self.t_first_speak is not None:
+            elapsed_ms = (time.monotonic() - self.t_first_speak) * 1000
+            return elapsed_ms >= BARGE_IN_VAD_GRACE_MS
+        return True
+
+    def _flush_system_utterance(self) -> None:
+        """Emit the turn's pending canned utterance (greeting / filler / idle) as a
+        system_utterance op, carrying the audio captured for it in _tts_rx. Called at
+        the turn boundary (once the audio exists), so the op holds the sound."""
+        if self._pending_sys_utt is None:
+            return
+        text, kind = self._pending_sys_utt
+        self._pending_sys_utt = None
+        audio = bytes(self._sys_tts_buf) if self._sys_tts_buf else None
+        self._sys_tts_buf.clear()
+        self.trace.system_utterance(text, kind, audio=audio)
+
+    # ------------------------------------------------------------------ image auto-send
+
+    def _arm_image_autosend(self) -> None:
+        """(Re)start the countdown that auto-sends a lone pending photo to the LLM after
+        IMAGE_AUTOSEND_S of silence. Only arms while idle; if the caller speaks (or types)
+        first, the photo rides with their words instead and the timer is cancelled. The
+        timer re-checks every condition before it actually fires."""
+        self._cancel_image_autosend()
+        if self.state is not State.LISTENING:
+            return  # agent is busy; the photo waits for the next real user turn
+        self._image_autosend_task = asyncio.create_task(
+            self._image_autosend_timer(), name="image_autosend")
+
+    def _cancel_image_autosend(self) -> None:
+        if self._image_autosend_task and not self._image_autosend_task.done():
+            self._image_autosend_task.cancel()
+        self._image_autosend_task = None
+
+    async def _image_autosend_timer(self) -> None:
+        try:
+            await asyncio.sleep(IMAGE_AUTOSEND_S)
+        except asyncio.CancelledError:
+            return
+        # Clear our own handle BEFORE starting the turn so _begin_agent_turn's cancel is
+        # a harmless no-op (never cancels the task it's running inside).
+        self._image_autosend_task = None
+        # Re-verify: the photo is still waiting, nobody is speaking, no turn in flight.
+        if not self.pending_image or self.state is not State.LISTENING:
+            return
+        if self.agent_task and not self.agent_task.done():
+            return
+        log.info("photo idle %.1fs with no speech -> auto-sending it to the LLM",
+                 IMAGE_AUTOSEND_S)
+        self.t_turn_end = time.monotonic()  # baseline for this turn's v2v metric
+        self._begin_agent_turn(user_text="", image_autosend=True)
+
+    def _snapshot_mic(self) -> bytes | None:
+        """Return (and clear) the mic PCM buffered for the turn just ended. Always
+        clears so the buffer can't grow without bound; returns None when empty or
+        when media capture is off."""
+        if not self._mic_buf:
+            return None
+        data = bytes(self._mic_buf)
+        self._mic_buf.clear()
+        return data if self.trace.capture_media else None
 
     async def _idle_watcher(self) -> None:
         """Hang up a call the caller has abandoned. After IDLE_PROMPT_S of silence
@@ -495,13 +815,13 @@ class Session:
                 self.t_nudge = now
                 self.idle_turn = True
                 log.info("idle %.0fs -> nudging the caller", now - self.t_last_activity)
-                self._begin_agent_turn(scripted=IDLE_PROMPT_PHRASE)
+                self._begin_agent_turn(scripted=IDLE_PROMPT_PHRASE, kind="idle_prompt")
             elif self.idle_stage == 1 and now - self.t_nudge >= IDLE_HANGUP_S:
                 self.idle_stage = 2
                 self.ending = True
                 self.idle_turn = True
                 log.info("idle hang-up: no response after the nudge")
-                self._begin_agent_turn(scripted=IDLE_GOODBYE_PHRASE)
+                self._begin_agent_turn(scripted=IDLE_GOODBYE_PHRASE, kind="idle_goodbye")
 
     # ------------------------------------------------------------------ context management
 
@@ -534,16 +854,44 @@ class Session:
         log.info("history summarized: %d msgs -> call notes (%d -> %d est. tokens)",
                  len(old), before, self._history_tokens())
 
+    def _capture_photo_note(self, raw_text: str, image_msg: dict | None) -> None:
+        """After an image turn, pull the model's silent [[PHOTO: ...]] description out of
+        the raw reply and associate it with this turn's image message, so the image can be
+        collapsed to a content-labelled text note (see _collapse_image_messages).
+
+        We deliberately LEAVE the raw [[PHOTO: ...]] marker on the assistant message that
+        llm.agent_reply appended. It is cheap text (never the base64), it is never spoken
+        (the streaming loop withholds it and _speak strips it), and keeping it gives the
+        model a consistent few-shot example of its own prior output — without it, gpt-4o-mini
+        reliably STOPS emitting the note from the second photo turn onward.
+
+        No-op when the turn had no image or the model omitted the note (we then fall back
+        to the generic placeholder in _collapse_image_messages)."""
+        if image_msg is None:
+            return
+        note = _extract_photo_note(raw_text)
+        if note:
+            self._image_descriptions[id(image_msg)] = note
+
     def _collapse_image_messages(self) -> None:
         """Replace any image-bearing user message (list content) with a short text
         note. The photo is sent to the model only on the turn it arrived; keeping the
-        base64 in history would resend it — and its tokens — on every later turn."""
+        base64 in history would resend it — and its tokens — on every later turn.
+
+        If a content-labelled description was captured from the model's photo note
+        (see _capture_photo_note), the collapsed note carries WHAT the photo showed so
+        the agent remembers it as cheap text; otherwise it falls back to a generic
+        placeholder so history is never left holding base64."""
         for m in self.messages:
             content = m.get("content")
             if m.get("role") == "user" and isinstance(content, list):
                 text = next((p.get("text", "") for p in content
                              if isinstance(p, dict) and p.get("type") == "text"), "")
-                m["content"] = (text + " [customer shared a photo]").strip()
+                desc = self._image_descriptions.pop(id(m), None)
+                if desc:
+                    m["content"] = f"[Photo the customer shared — {desc}] {text}".strip()
+                else:
+                    m["content"] = (text + " [customer shared a photo]").strip()
 
     async def _close_after(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -562,9 +910,21 @@ class Session:
           5. tell the browser          -> it zeroes its playback ring buffer instantly
         """
         self.total_barge_ins += 1
+        self._vad_pre_armed = False  # consumed: this interrupt is now committing
         if self.metrics:
             self.metrics.barge_in = True
             await self._send_metrics()  # record the interrupted turn's partial metrics
+        # Emit the interrupted turn's trace now (its task is about to be cancelled, so
+        # _finish_agent_turn won't run). What was actually spoken is its assistant_text,
+        # and whatever reply audio was played is attached. A canned utterance interrupted
+        # mid-flight (e.g. the greeting) is still emitted with its partial audio.
+        self._flush_system_utterance()
+        if self.tt:
+            self.tt.set_tts_audio(bytes(self._tts_buf))
+            self.trace.finish_turn(
+                self.tt, assistant_text=" ".join(self.spoken_sentences).strip(),
+                interrupted=True, ended=False, metrics=self.metrics)
+            self.tt = None
         interrupted_turn = self.turn_id
         self.turn_id += 1
         self.ending = False  # "...wait, actually" during the goodbye un-ends the call

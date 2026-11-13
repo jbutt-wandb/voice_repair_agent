@@ -276,11 +276,27 @@ simultaneously:
 4. the browser's ring buffer holds seconds of not-yet-played sound.
 
 **Detection** first: remember that mic audio streams to Deepgram continuously,
-even while the agent speaks. So when you talk over the agent, Deepgram produces an
-interim transcript for your new speech. The rule in `session.py::_stt_rx` is: *a
-non-empty interim transcript arriving while the state is THINKING or SPEAKING = a
-barge-in.* We use transcripts rather than raw "voice activity" events because
-transcripts require actual words — a cough or a door slam doesn't produce one.
+even while the agent speaks. Deepgram gives us two signals that the user has started
+talking over the agent, and this app fires on whichever comes first:
+
+- **VAD onset** — Deepgram's `SpeechStarted` event, raised the instant the
+  voice-activity detector hears speech *begin*, before a single word is recognized.
+  This is the fast path, and it's what makes even a *short* reply interruptible: by
+  the time a transcript exists the agent might already have finished talking.
+- **Interim transcript** (the fallback) — a non-empty interim arriving while the
+  state is THINKING or SPEAKING. Slower, because it waits for recognized words, but
+  it requires *actual words*, so a cough or a door slam can't trigger it.
+
+The trade in acting on VAD onset is the mirror image of the transcript's strength:
+speed for a little robustness (a loud background noise can occasionally trip it). Two
+guards keep the agent from interrupting *itself* on its own voice coming back through
+the mic: the browser's echo cancellation (next section), and a short grace window
+(`BARGE_IN_VAD_GRACE_MS`, default 250 ms) after the agent's first audio before a VAD
+onset is allowed to fire — you essentially never barge in that fast, so it costs no
+real responsiveness. The whole VAD path is a toggle (`BARGE_IN_ON_VAD`); turn it off
+and the transcript trigger alone still works. Either way this only *shortens*
+time-to-interrupt — it adds zero latency to anything. (Both paths land in
+`session.py::_stt_rx`.)
 
 **Cancellation** then has to kill all four in-flight copies. From
 `session.py::_barge_in`, in order:
@@ -319,6 +335,39 @@ agent's own voice coming out of your speakers. The browser's echo cancellation
 and a sensitive mic the agent can occasionally interrupt itself. Headphones make
 the demo bulletproof. In production telephony this is a whole engineering topic —
 see [doc 03](03-production-challenges.md).
+
+## Photos: a second way in
+
+The customer isn't limited to their voice — they can send a photo (a display, an
+error code, a leaking hose), and the same turn machinery handles it. Three details
+are worth calling out, because each one exists to keep a *visual* feature from
+taxing the *voice* loop.
+
+**The image rides with the next turn.** A photo arrives over the WebSocket as a
+base64 data URL and waits as `pending_image`; when the user next speaks, the image
+and their words go to the (multimodal) LLM together — image *first*, then the text,
+the ordering that makes the vision model reliably look before it answers.
+
+**A filler masks vision latency.** A vision call is slower than a text one (~1.8 s
+here). Rather than leave dead air, the agent speaks a short canned line — "Let me
+take a look." — while the model thinks. These filler phrases are TTS-only; they're
+never added to the conversation the model sees, so they cost zero tokens (and in a
+trace they show up as their own `system_utterance`, not as something the model
+"said").
+
+**Lone-image auto-send.** What if the caller uploads a photo and then just… waits,
+expecting the agent to react? Waiting for speech that never comes feels broken. So
+if a photo is pending and the caller stays silent for `IMAGE_AUTOSEND_S` (default
+2 s), the session auto-starts a turn itself, feeding the image to the LLM with a
+minimal default prompt (same image-first ordering). The timer arms when the photo
+lands while the agent is idle, cancels the moment the caller speaks, types, or sends
+another photo, and re-arms when the pipeline returns to LISTENING. The turn is
+tagged `image_autosend=true` so a reviewer can see the agent moved on its own.
+
+What the agent *remembers* about a photo after that turn is its own optimization —
+and an important one, because a resident image makes every later turn slower. It's
+told with the rest of the context story in
+[doc 03 §6](03-production-challenges.md#6-long-calls-context-growth).
 
 ## Hanging up: the natural end of a call
 
@@ -375,6 +424,17 @@ Notice the stages roughly add up: endpoint wait + TTFT + TTFB ≈ voice-to-voice
 That's the point of per-stage metrics — when the total is too slow, you know
 *which* stage to attack.
 
+### Beyond the live panel: tracing a finished call
+
+The metrics panel is for *now*; reviewing a call *later* is a different need. When
+Weave tracing is enabled, every turn is also shipped to W&B Weave as a structured
+span tree — the transcript, the per-stage latencies above, tool calls, token cost,
+and even the audio of *both* sides of the turn — so you can scrub a real
+conversation after the fact. Crucially, that trace is assembled and flushed at the
+*turn boundary, off the voice hot path*, so it adds exactly zero to the second you
+just measured. The full design is in
+[doc 03 §10](03-production-challenges.md#10-observability-you-cant-debug-voice-from-text-logs).
+
 ## Recap: the full journey in 12 steps
 
 1. Mic captures 48 kHz float32 → worklet downsamples to 16 kHz int16, 40 ms frames
@@ -388,9 +448,9 @@ That's the point of per-stage metrics — when the total is too slow, you know
 9. Audio chunks stream back, get tagged by turn, and are forwarded to the browser
 10. First chunk forwarded → state SPEAKING; browser ring buffer plays it
 11. All sentences flushed + LLM done → back to LISTENING
-12. At any point during 6–11, user speech triggers barge-in: bump turn_id, cancel
-    LLM, Clear TTS, zero the ring buffer, store only the spoken sentences in
-    history, go to LISTENING
+12. At any point during 6–11, user speech triggers barge-in (fired by VAD onset or,
+    as fallback, an interim transcript): bump turn_id, cancel LLM, Clear TTS, zero
+    the ring buffer, store only the spoken sentences in history, go to LISTENING
 13. Between turns, if history has grown past the threshold, old turns are
     compressed into "call notes" in the background (doc 03 §6)
 14. When the user says they're done, the model invokes `end_call`, says goodbye,

@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
 from .session import Session
+from .weave_trace import init_weave
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(name)-8s %(levelname)-7s %(message)s")
@@ -21,6 +22,9 @@ log = logging.getLogger("app")
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 app = FastAPI(title="Voice Repair Agent")
+
+# Initialise Weave tracing once for the whole process (no-op without WANDB_API_KEY).
+init_weave()
 
 
 @app.websocket("/ws")

@@ -46,12 +46,24 @@ Watch the UI while you talk and you can see the lifecycle: gray italic text that
 rewrites itself ("my washing" → "my washing machine won't") and then snaps into a
 solid bubble when finalized.
 
-Interims are a two-for-one deal. They power the captions, but they're also the
-interruption detector: because this app streams mic audio in *every* state, an
+Interims are a two-for-one deal. They power the captions, and they're *also* one of
+two interruption detectors: because this app streams mic audio in *every* state, an
 interim with actual words arriving while the agent is speaking means the user is
-talking over it → barge-in (`session.py::_stt_rx`). Deepgram also offers raw
-voice-activity events (`SpeechStarted`), but a transcript is a much stronger
-signal than "sound happened" — a cough doesn't produce words.
+talking over it → barge-in (`session.py::_stt_rx`).
+
+Deepgram also emits a raw voice-activity event, `SpeechStarted`, the instant it
+hears speech *begin* — before any word is recognized. A transcript is the *stronger*
+signal ("words happened", not just "sound happened" — a cough produces no words), but
+it is also the *slower* one, and for barge-in speed wins: by the time an interim
+exists, a short agent reply may already be over. So this app fires on `SpeechStarted`
+as the **primary** trigger and keeps the interim-transcript path as the fallback. The
+cost of the faster signal — it can trip on a loud background noise, and on the
+agent's own voice echoing back — is bought off by browser echo cancellation plus a
+short grace window after the agent starts speaking (`BARGE_IN_VAD_GRACE_MS`), and the
+whole VAD path can be switched off (`BARGE_IN_ON_VAD=0`) to fall back to transcripts
+alone. The full barge-in story is in
+[doc 01](01-how-this-app-works.md#barge-in-interrupting-the-agent) and
+[doc 03 §5](03-production-challenges.md#5-interruption-correctness-everything-must-be-cancellable).
 
 ### Endpointing: the turn-taking primitive
 
@@ -222,7 +234,7 @@ What Deepgram contributes to this app's ~1-second voice-to-voice loop:
 |---|---|---|
 | hearing you | nova-3 streaming STT, interim results | transcript ready ~as you finish |
 | knowing you're done | endpointing (300 ms) + UtteranceEnd fallback | `stt_final` ~300–800 ms |
-| noticing interruptions | continuous STT + interim transcripts | barge-in trigger |
+| noticing interruptions | `SpeechStarted` VAD onset (+ interim-transcript fallback) | barge-in fires on speech onset |
 | speaking | aura-2 over the speak WebSocket | TTFB ~200 ms |
 | shutting up | `Clear` + (our) turn tags | audio stops <200 ms after you speak |
 

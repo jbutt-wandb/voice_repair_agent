@@ -7,14 +7,16 @@ quick reference). Read in order:
    kicked off the project, so you can see where it all started.
 1. **[01-how-this-app-works.md](01-how-this-app-works.md)** — the life of one
    spoken turn: mic → STT → state machine → LLM → sentence chunking → TTS →
-   ring-buffer playback, why everything streams, how barge-in works, and how the
-   agent hangs up when you're done.
+   ring-buffer playback, why everything streams, how barge-in works (now on VAD
+   onset), how photos ride the pipeline, and how the agent hangs up when you're done.
 2. **[02-how-deepgram-solves-the-problem.md](02-how-deepgram-solves-the-problem.md)** —
    the real-time STT/TTS problems and how Deepgram's APIs solve them: endpointing,
    interim results, Speak/Flush/Clear — plus the two gotchas we hit in testing.
 3. **[03-production-challenges.md](03-production-challenges.md)** — what gets hard
    in the wild: latency tails, WER, echo, turn-taking, cancellation correctness,
-   context growth, safety guardrails, scaling, cost, observability.
+   context growth (incl. photo→text memory), safety guardrails and the scope block,
+   scaling, cost, and a worked-example observability layer (per-turn W&B Weave
+   traces) — all added under one rule: never regress voice-to-voice latency.
 4. **[04-building-this-with-an-agent.md](04-building-this-with-an-agent.md)** — the
    *process* story: how this app was built in collaboration with a coding agent,
    and a transferable playbook for driving one yourself.

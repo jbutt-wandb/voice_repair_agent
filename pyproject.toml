@@ -10,4 +10,5 @@ dependencies = [
     "deepgram-sdk>=3.8",
     "openai>=1.60",
     "python-dotenv>=1.0",
+    "weave>=0.53.12",
 ]

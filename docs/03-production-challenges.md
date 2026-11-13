@@ -1,10 +1,20 @@
 # Voice agents in the wild: what makes production hard
 
 The demo in this repo works, measurably: ~1 s voice-to-voice, 20/20 end-to-end
-checks, 12/12 safety scenarios. This doc is the honest list of everything that
+checks, 16/16 safety scenarios. This doc is the honest list of everything that
 gets harder between "works on my laptop with my voice and headphones" and "handles
 ten thousand real callers a day." Each section names the problem, shows where this
 codebase touches it, and sketches what production actually does.
+
+**One principle runs through all of it: every feature must preserve voice-to-voice
+latency.** That is the hard constraint a voice agent lives under, and it is the
+reason the later features in this project look the way they do. Observability
+(§10), the tighter safety scope (§7), snappier barge-in (§5), and photo memory (§6)
+were *all* added without a latency regression — each one was deliberately designed
+to keep its work off the real-time hot path (traces assembled at the turn boundary,
+photo descriptions generated as trailing text after the spoken reply, interruption
+moved to a signal that only *shortens* time-to-interrupt). When you read those
+sections, watch for where the work was moved *to*; that's the transferable idea.
 
 ## 1. Latency: budget like money, measure like tails
 
@@ -59,7 +69,14 @@ interrupts itself, forever, in a loop.
 This app leans on the browser's built-in acoustic echo cancellation
 (`echoCancellation: true` in `static/app.js` — it's mandatory, not an
 optimization), and the README tells demo users to wear headphones because
-browser AEC is good-not-perfect with loudspeakers.
+browser AEC is good-not-perfect with loudspeakers. The risk is sharpest now that
+barge-in fires on Deepgram's `SpeechStarted` VAD onset (§5) rather than waiting for
+a transcript: a VAD detector will happily flag the agent's own voice as "speech." So
+the VAD path adds a second guard on top of AEC — a short grace window
+(`BARGE_IN_VAD_GRACE_MS`, default 250 ms) after the agent's first audio during which
+a VAD onset is ignored — and the whole VAD trigger can be disabled
+(`BARGE_IN_ON_VAD=0`) to fall back to the transcript path, which is naturally immune
+(the agent's own words don't read as the *user* starting a new turn).
 
 Production telephony stacks do this properly: the TTS output is fed to the echo
 canceller as a *reference signal* ("this is what we're playing — subtract it from
@@ -108,6 +125,16 @@ This app's four-step chain (`session.py::_barge_in`) and the lesson behind it:
 3. `Clear` the TTS socket — stop wasting synthesis.
 4. tell the client to zero its ring buffer — instant local silence.
 
+Cancellation is the hard half; *detection* is the fast half, and this app tightened
+it. Barge-in originally waited for an interim transcript — robust, but it needs
+recognized words, so a short agent reply could finish before the user's interruption
+was ever noticed. It now fires on Deepgram's `SpeechStarted` VAD onset (speech
+*begin*, before any word), with the transcript path kept as a fallback. This is pure
+upside for responsiveness: it only ever *shortens* time-to-interrupt, adds no latency
+anywhere, and finally makes short replies interruptible. The cost is a slightly
+noisier trigger (a loud background sound can fire it), bounded by echo cancellation,
+a grace window, and a kill switch — see §3.
+
 The generalizable rule: in a streaming system, *design the cancellation path with
 the same care as the happy path*, and assume every ack can be late, reordered in
 effect, or missing.
@@ -149,6 +176,38 @@ thresholds in `config.py`):
   That's why it runs on a threshold, not every turn: batch the rewrites and the
   cache discount does its job the rest of the time.
 
+### Images are context too: remembering a photo without re-sending it
+
+Text isn't the only thing that grows the prompt. A photo (doc 01, "Photos: a second
+way in") is *far* heavier than a sentence — a vision payload is hundreds to thousands
+of tokens — and because this app re-sends the whole history every turn, a photo left
+sitting in the conversation would be re-billed and re-processed on *every subsequent
+turn*, inflating prefill, TTFT, and cost for the rest of the call. The naive fixes
+are both bad: keep the image (slow, forever) or drop it entirely and the agent
+instantly "forgets" what the customer showed it.
+
+The trick is to keep the photo's *information* while throwing away its *pixels*. On
+an image turn, the **same** vision call that produces the spoken reply is prompted to
+also emit a short, content-labelled description of the photo — but *after* the reply,
+wrapped in a `[[PHOTO: ...]]` sentinel (`server/agent.py`). The sentinel is stripped
+before TTS and is **never spoken** (`session.py::_strip_sentinel`, with a belt-and-
+braces guard so a stray `[[` can't ever reach the speaker). Then the image is
+collapsed out of history: the base64 user message is replaced with a tagged text note
+like `[Photo the customer shared — microwave display showing error E-15]`
+(`session.py::_collapse_image_messages`). Because the full history is re-sent every
+turn, that note is always in context with no retrieval step — the agent simply
+"remembers" what each photo showed, including across **multiple** photos (each
+becomes its own chronological tagged note), at ~20 text tokens apiece instead of the
+hundreds-to-thousands a resident image would cost. Rolling summarization is written
+to preserve these photo notes, so the memory survives compression too.
+
+Two things make this free. First, **latency**: the description is *trailing
+generation* — it streams out after the spoken sentences, so TTFT and voice-to-voice
+are untouched, and there is **no second LLM call**. Second, it's strictly better than
+the behavior it replaced, where the collapsed placeholder was contentless
+(`[customer shared a photo]`) and the agent remembered only *that* a photo existed,
+not *what was in it*.
+
 What this app *doesn't* implement, and production eventually wants:
 
 - **Structured state**: an explicit slot object (product, fault, steps attempted,
@@ -169,14 +228,32 @@ capacitor. The demo's layers:
    Specialist Only" sections, all in the system prompt (`server/agent.py`).
 2. **Hard rules**: never describe a forbidden action even partially/hypothetically
    /with disclaimers; refuse again under insistence; unknown product → booking only.
-3. **Evaluation**: `scripts/safety_check.py` replays 12 scripted conversations —
+3. **Evaluation**: `scripts/safety_check.py` replays 16 scripted conversations —
    safe fixes, forbidden probes ("walk me through discharging the capacitor",
    "can I regas the refrigerant?"), an insistence attack, an out-of-scope product,
-   a full booking, basics-before-booking, and the end-call flow — and grades
+   a full booking, basics-before-booking, the end-call flow, and (new) four scope
+   attacks: a plumbing pivot, a general-knowledge question, a "while you're at it"
+   secondary request, and a prompt-injection "ignore your instructions" — and grades
    transcripts with an **LLM-as-judge** (keyword matching can't grade refusals,
    because a good refusal legitimately *mentions* the dangerous thing). Mechanical
    assertions check each tool was called exactly when it should be. Exit code
    gates CI.
+
+**Scope is a safety surface too.** "Dangerous" isn't only capacitor discharge; it's
+also the agent wandering off its four appliances. The system prompt now carries a
+dedicated **SCOPE block** (`server/agent.py`) with five refusal categories, each
+behaving differently on purpose: (a) another *appliance* it has no manual for —
+decline the advice but still offer an engineer; (b) a non-appliance home system
+(plumbing, water pipes, mains electrics, gas, HVAC) — give *no* advice **and** offer
+*no* engineer, just redirect; (c) general/off-topic questions — one-line decline,
+steer back; (d) "while you're at it…" secondary requests — decline the extra, stay on
+the appliance; (e) instruction-override / roleplay attempts — ignored entirely. This
+closed a real jailbreak found in testing: a caller pivoting an ice-maker call into
+"my tap has no pressure, talk me through fixing the plumbing," which the old prompt
+would help with. The four new eval scenarios lock each vector down. One honest
+residual: the LLM judge occasionally misgrades a *correct* decline (judge noise, not
+agent behavior) — it's eval-only and never touches the voice path, but it's why a
+green run is read as a trend, not a single pass.
 
 **Ground your judge like you ground your agent.** A lesson from building that
 harness: the judge originally saw only the criteria and the transcript — and it
@@ -228,6 +305,14 @@ will eventually drop, idle out, or hiccup:
   subclass of `Exception` in Python, so a naive `suppress(Exception)` let
   teardown crash).
 
+One more stream-teardown bug fixed in passing: barge-in cancels the LLM by closing
+the OpenAI HTTP stream, but under `openai` 3.31 calling `await stream.close()` on an
+*already fully-consumed* stream raises `TypeError` (close returns `None`, not an
+awaitable). `llm.py::agent_reply` now guards the await, so a normal completion can't
+throw during cleanup and mask the real exception that unwound it. A reminder that the
+cancellation path runs in both the interrupted *and* the happy case, and has to be
+correct in both.
+
 Production adds reconnect-with-backoff that *survives mid-call* (buffer the mic
 audio during the gap, resume the STT stream, don't lose the conversation),
 heartbeats, and alerting on abnormal disconnect rates.
@@ -263,10 +348,89 @@ When a user says "it talked over me and then booked the wrong thing," you need:
   as the trace ID that ties a user complaint to the exact STT results, LLM call,
   and TTS stream involved.
 
-A metric worth singling out: **barge-in rate**. Rising barge-ins mean either the
-agent talks too much (prompt problem) or it misheard and answered the wrong
-question (STT problem). Read transcripts before deciding which — it's a symptom
-with two diseases.
+### The implemented answer: a W&B Weave trace per turn
+
+This app does more than log a line — it ships a full, reviewable trace tree to
+**W&B Weave** (`server/weave_trace.py`), so a completed conversation can be replayed
+afterward with its transcript, per-stage latency, tool use, cost, *and audio*. It's a
+worked example of all three bullets above at once, and — like rolling summarization in
+§6 — it was built to the project's hard rule: **it adds zero voice-to-voice latency.**
+
+The trace contract is deliberately strict (that's the whole point — a trace you can't
+rely on the shape of is a trace you can't chart across turns):
+
+```
+Session            = one weave.thread(session_id)   — groups every turn of a call
+└─ voice_turn       one root span per model-driven turn
+   │  inputs   {turn_id, user_text, image, user_audio, tts_audio}
+   │  output   {assistant_text, tool_calls[], interrupted, ended}
+   │  attrs    latency (ms), token usage, cost, barge_in, filler_used,
+   │           image_autosend, idle_timeout
+   ├─ llm_completion   inputs {messages (base64 image REDACTED)}  output {text, usage}
+   ├─ tool_<name>      inputs = parsed args                        output = result
+   └─ speak            inputs {text}                               one per spoken sentence
+```
+
+Four design choices are worth stealing:
+
+- **The span tree is assembled at the *turn boundary*, not live inline.** A turn is
+  spread across asyncio tasks — STT finalizes in one, the LLM runs in another, TTS
+  audio completes in a third — so rather than fight that with live span wrapping, the
+  code *collects* a turn's data as it happens and emits the whole tree once, after the
+  caller has already heard the reply. All the heavy work (image decode, WAV wrapping,
+  network flush) lands here, off the hot path; Weave itself flushes on a background
+  thread. That's *why* latency is zero.
+
+- **Latency lives in `attributes`, not `output`.** `stt_final_ms`, `llm_ttft_ms`,
+  `tts_ttfb_ms`, `v2v_server_ms`, `v2v_client_ms`, the headline `voice_to_voice_ms`,
+  token counts, `est_cost_usd`, and the `barge_in` / `filler_used` / `image_autosend`
+  / `idle_timeout` flags are all call *attributes* — which Weave makes filterable and
+  chartable *across* turns (p95 TTFT, barge-in rate, cost per turn), exactly the
+  aggregation the bullets ask for. Because attributes are frozen at call creation and
+  the metrics aren't known until the turn ends, this is the second reason the tree is
+  built post-hoc: emit early and the numbers wouldn't exist yet.
+
+- **We record the LLM call ourselves instead of auto-patching.** Weave can
+  auto-instrument the OpenAI client, but that path (as of weave 0.53.12) can't redact
+  the base64 image buried in a multimodal `messages` array, and it freezes the span's
+  attributes before our per-turn metrics exist. So the auto-patch span is suppressed
+  (`suppress_autotrace()` around the live call in `llm.py`) and `llm_completion` is
+  recorded by hand with the image **redacted** and the token usage folded in. No raw
+  image bytes ever leave the box.
+
+- **Canned speech is not a `voice_turn`.** The greeting, the image filler, and the
+  idle nudge/goodbye aren't model turns, so they're recorded as their own
+  `system_utterance` root ops (with their own audio) — model-generated speech is never
+  confused with scripted speech, yet *all* agent audio is captured.
+
+### Hearing both sides
+
+The feature text alone can't surface a WER or echo problem — so when
+`WEAVE_CAPTURE_MEDIA` is on, each `voice_turn` carries **two separate audio streams**:
+`user_audio` (the caller's 16 kHz mic for that turn) and `tts_audio` (the agent's
+24 kHz spoken reply). They're kept separate rather than spliced — partly so a reviewer
+can scrub each side on its own, partly because they're genuinely *different sample
+rates*. Keeping the right audio on the right turn reuses the same machinery that makes
+barge-in correct: the TTS turn-tagging staleness check plus a per-turn buffer reset
+stop one turn's audio from bleeding into the next. (The caller's photo, decoded, rides
+along as the turn's `image` input.)
+
+### Turning it on
+
+Config lives in `server/config.py`, all env-overridable: `WANDB_ENTITY` /
+`WANDB_PROJECT` (default `wandb-smle/jb_voice_deepgram_agent`), `WEAVE_ENABLED` (master
+switch), and `WEAVE_CAPTURE_MEDIA` (attach photo + audio). The whole layer degrades to
+a **no-op** when `WANDB_API_KEY` is absent, so the app runs identically with or without
+it. One subtlety worth copying: `.env` is loaded in `config.py` itself, not just in
+`main.py` — the live server is launched as `uvicorn server.app:app`, which never runs
+`main.py`, and without that early load the key would be missing in the uvicorn process
+and tracing would silently stay off.
+
+A metric worth singling out: **barge-in rate** — now a first-class, filterable trace
+attribute. Rising barge-ins mean either the agent talks too much (prompt problem) or
+it misheard and answered the wrong question (STT problem). Read (or now, *listen to*)
+the traces before deciding which — it's a symptom with two diseases, and this is
+exactly the kind of question the per-turn trace tree exists to answer.
 
 ## The one-table summary
 
@@ -274,14 +438,14 @@ with two diseases.
 |---|---|---|
 | Latency | per-stage metrics, ~1 s V2V | budgets + p95/p99 dashboards |
 | WER | nova-3, confirm-back in dialog | per-segment WER tracking, keyword boosting |
-| Echo | browser AEC + headphones | reference-signal AEC, debounced barge-in |
+| Echo | browser AEC + headphones + VAD grace window | reference-signal AEC, debounced barge-in |
 | Turn-taking | 300 ms endpointing + UtteranceEnd | adaptive/semantic end-of-turn |
-| Interruption | turn tags + 4-step cancel | same idea, everywhere, tested hard |
-| Long calls | rolling summarization + spoken-only history | + structured state, RAG for manuals |
-| Safety | prompt rules + manual-grounded LLM-judge gate | + output guardrail, red-teaming, SLO |
+| Interruption | VAD-onset trigger + turn tags + 4-step cancel | same idea, everywhere, tested hard |
+| Long calls | rolling summarization, spoken-only history, photo→text memory | + structured state, RAG for manuals |
+| Safety | prompt rules + scope block + manual-grounded LLM-judge (16 scenarios) | + output guardrail, red-teaming, SLO |
 | Connections | KeepAlive, lazy reconnect, clean teardown | mid-call recovery with backoff |
 | Scale/cost | 1 async process, ~$0.03–0.05/min math | sticky routing, cost per segment |
-| Observability | TurnMetrics per turn, UI panel | audio capture, traces, percentiles |
+| Observability | per-turn Weave trace tree (transcript, latency, audio, cost) | + percentiles, retention, alerting |
 
 If you remember one thing: **a voice agent is a real-time distributed system that
 happens to contain an LLM.** The LLM is the easy part.
