@@ -37,6 +37,7 @@ BROWSER <-> SERVER PROTOCOL (one WebSocket)
 from __future__ import annotations
 
 import asyncio
+import array
 import contextlib
 import datetime
 import enum
@@ -55,12 +56,14 @@ from openai import AsyncOpenAI
 
 from . import llm
 from .agent import build_system_prompt
+from .agent_lens import log_agent_turn
 from .config import (BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
                      CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
                      DEFAULT_IMAGE_PROMPT, IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S,
                      IDLE_PROMPT_PHRASE, IDLE_PROMPT_S, IMAGE_AUTOSEND_S,
                      IMAGE_FILLER_PHRASES, IMAGE_NOTE_REMINDER, LATENCY_LOG_DIR,
-                     MIN_SENTENCE_CHARS, VOCAL_JUDGE_ENABLED)
+                     MIN_SENTENCE_CHARS, STT_SAMPLE_RATE, TTS_SAMPLE_RATE,
+                     VOCAL_JUDGE_ENABLED)
 from .stt import DeepgramSTT, SpeechStarted, Transcript, UtteranceEnd
 from .tts import AudioChunk, Cleared, DeepgramTTS, Flushed
 from .vocal_judge import classify_vocal
@@ -78,6 +81,38 @@ def _p95(values: list[float]) -> float:
     ordered = sorted(values)
     rank = max(1, -(-len(ordered) * 95 // 100))  # ceil(0.95*n)
     return ordered[rank - 1]
+
+
+# Leading-silence trim for the per-turn mic snapshot (observability only — the live
+# STT stream is never touched). The mic rolls continuously between turn boundaries,
+# so an untrimmed clip is mostly the agent's own reply playing out (near-silence
+# after browser echo cancellation) plus the caller's thinking pause.
+_TRIM_FRAME_SAMPLES = 320            # 20 ms frames at 16 kHz
+_TRIM_THRESHOLD = 500                # int16 peak floor ~1.5% full scale
+_TRIM_PEAK_DIVISOR = 6               # ...raised to clip_peak/6: live-call boundary blips
+                                     # (the agent's own audio tail / echo ramp, measured
+                                     # peaks ~1-2k) sit far below real speech (9-32k), so
+                                     # the speech threshold must scale with THIS clip
+_TRIM_PREROLL_BYTES = 16000 * 2      # keep 1 s before the first voiced frame: barge-in
+                                     # context survives and a late threshold can't clip speech
+
+
+def _trim_leading_silence(pcm: bytes) -> bytes:
+    """Drop everything before the caller's first genuinely-voiced 20 ms frame,
+    keeping a 1 s pre-roll. "Voiced" is relative to the clip's own loudness
+    (max of a fixed floor and clip_peak/6), so a short boundary blip at second
+    zero can't defeat the trim. If nothing qualifies, return the clip untouched."""
+    samples = array.array("h", pcm[: len(pcm) // 2 * 2])
+    if not samples:
+        return pcm
+    clip_peak = max(max(samples), -min(samples))
+    threshold = max(_TRIM_THRESHOLD, clip_peak // _TRIM_PEAK_DIVISOR)
+    for i in range(0, len(samples), _TRIM_FRAME_SAMPLES):
+        frame = samples[i:i + _TRIM_FRAME_SAMPLES]
+        if frame and max(max(frame), -min(frame)) >= threshold:
+            return pcm[max(0, i * 2 - _TRIM_PREROLL_BYTES):]
+    return pcm
+
 
 GREETING = ("Hi, you're through to HomeFix Appliances repair support, this is Alex. "
             "Which appliance can I help you with today?")
@@ -746,6 +781,15 @@ class Session:
         self.trace.finish_turn(tt, assistant_text=assistant_text,
                                interrupted=interrupted, ended=ended,
                                metrics=metrics, vocal=vocal)
+        # Mirror the turn into the Agents view (Agent Lens) — a separate span store,
+        # so the voice_turn trace above is unaffected. Sync network I/O inside, so it
+        # runs on a worker thread, never the event loop.
+        if self.trace.enabled:
+            await asyncio.to_thread(
+                log_agent_turn, session_id=self.session_id, tt=tt,
+                assistant_text=assistant_text, interrupted=interrupted, ended=ended,
+                metrics=metrics, system_prompt=str(self.messages[0]["content"]),
+                stt_rate=STT_SAMPLE_RATE, tts_rate=TTS_SAMPLE_RATE, vocal=vocal)
 
     def _mark_activity(self) -> None:
         """Any real user input (speech, typing, a photo) resets the inactivity
@@ -823,10 +867,14 @@ class Session:
     def _snapshot_mic(self) -> bytes | None:
         """Return (and clear) the mic PCM buffered for the turn just ended. Always
         clears so the buffer can't grow without bound; returns None when empty or
-        when media capture is off."""
+        when media capture is off. Leading silence is trimmed (keeping a 1s
+        pre-roll) — the buffer rolls from the PREVIOUS turn boundary, so untrimmed
+        it spans the agent's whole reply + the caller's thinking pause before any
+        speech. This snapshot is observability-only (trace, Agent Lens, vocal
+        judge all consume it); the live STT stream is untouched."""
         if not self._mic_buf:
             return None
-        data = bytes(self._mic_buf)
+        data = _trim_leading_silence(bytes(self._mic_buf))
         self._mic_buf.clear()
         return data if self.trace.capture_media else None
 

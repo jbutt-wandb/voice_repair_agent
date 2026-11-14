@@ -17,13 +17,15 @@ Prerequisites: [uv](https://docs.astral.sh/uv/) and Chrome. Python 3.14 is pinne
 git clone <this-repo> && cd voice_repair_agent
 ```
 
-Create a `.env` in the project root with two required keys and one optional one:
+Copy the template and fill in the two required keys (the server refuses to start
+without them, with a clear error):
 
 ```bash
-DEEPGRAM_API_KEY=...   # create one at https://console.deepgram.com/
-OPENAI_API_KEY=...     # create one at https://platform.openai.com/api-keys
-WANDB_API_KEY=...      # OPTIONAL: https://wandb.ai/authorize — enables W&B Weave
-                       # tracing; without it the app runs fine, tracing just disables
+cp .env.example .env
+# DEEPGRAM_API_KEY  — create one at https://console.deepgram.com/
+# OPENAI_API_KEY    — create one at https://platform.openai.com/api-keys
+# WANDB_API_KEY     — OPTIONAL: https://wandb.ai/authorize — enables W&B Weave
+#                     tracing; without it the app runs fine, tracing just disables
 ```
 
 Then run it:
@@ -53,20 +55,28 @@ Verification gates and smoke tests:
 ```bash
 uv run scripts/safety_check.py   # the safety evaluation gate (see below)
 uv run scripts/e2e_check.py      # full-pipeline check over the real WebSocket (server must be up)
+uv run scripts/replay_session.py --scenario happy_path   # replay a canned call (audio + photo)
+uv run scripts/replay_session.py --scenario frustrated   # replay the frustration/jailbreak call
 uv run python -m server.tts      # standalone TTS smoke test
 uv run python -m server.stt      # standalone STT smoke test (loops TTS audio into STT)
 ```
 
 New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
-pieces link together in diagrams, and
+pieces link together in diagrams,
 [docs/06-weights-and-biases.md](docs/06-weights-and-biases.md) explains the W&B Weave
-integration. The full explainer series lives in [docs/](docs/README.md).
+integration, and [docs/07-trace-shaping.md](docs/07-trace-shaping.md) maps the two
+per-turn telemetry shapes (Weave `voice_turn` traces and the Agent Lens turns) field
+by field. The full explainer series lives in [docs/](docs/README.md).
 
 ## Configuration
 
 Every knob lives in [`server/config.py`](server/config.py) with the tradeoff it
-controls commented beside it. The ones you'd actually toggle (all env vars; booleans
-accept `0`/`false`/`no` as off):
+controls commented beside it, in three deliberate tiers: **secrets** (`.env` only —
+see `.env.example`), **deploy tunables** (the env vars below), and **product
+decisions** (plain constants you edit in the file). At startup the server fails fast
+with a fix-it message if a required key is missing, and logs one `config:` line
+showing the live values — so "which knobs are on?" never requires reading code.
+The tunables (booleans accept `0`/`false`/`no` as off):
 
 | Area | Variable | Default | Meaning |
 |---|---|---|---|
@@ -84,6 +94,9 @@ accept `0`/`false`/`no` as off):
 | Vocal judge | `VOCAL_JUDGE_ENABLED` | `1` | per-turn acoustic frustration/fear verdict on the caller's mic audio |
 | Vocal judge | `VOCAL_JUDGE_MODEL` | `gpt-audio-mini` | OpenAI audio model doing the judging |
 | Vocal judge | `VOCAL_JUDGE_TIMEOUT_S` | `8.0` | judge deadline; on timeout the trace ships without vocal flags |
+| Agent Lens | `AGENT_LENS_ENABLED` | `1` | emit each turn to the Forge Agents view (Agent Lens) as a conversation turn with audio bubbles |
+| Agent Lens | `AGENT_NAME` | `repair-agent` | the agent entity the turns file under in the Agents tab |
+| Agent Lens | `AGENT_VERSION` | `dev` | version label on the emitted turns (cross-deploy comparison) |
 
 \* `STT_ENDPOINTING_MS` is a constant in `config.py` (edit the file), not an env var —
 it's a product decision, not a deploy-time setting (see Production considerations §1).

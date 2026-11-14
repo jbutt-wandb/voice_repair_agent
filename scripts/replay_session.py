@@ -1,27 +1,35 @@
 """Replay a recorded call's caller audio through the live app — no re-recording.
 
     uv run main.py &                          # server must be up
-    uv run scripts/replay_session.py          # replay the newest traced call
-    uv run scripts/replay_session.py --thread <thread_id>   # or a specific one
+    uv run scripts/replay_session.py          # list the available scenarios
+    uv run scripts/replay_session.py --scenario frustrated   # replay a local fixture
+    uv run scripts/replay_session.py --thread <thread_id>    # ad-hoc: fetch from Weave
 
-Downloads each voice_turn's `user_audio` (the caller's mic, stored as playable
-media on the Weave trace) for one conversation thread, then streams the clips
-over the real WebSocket mic path exactly as a browser would: 1280-byte PCM
-chunks every 40 ms (real-time pacing — Deepgram's endpointing is time-based, so
-faster-than-realtime would change turn segmentation), a 2 s silence tail per
-clip so the turn closes, waiting out the agent's reply between clips.
+The primary mode is --scenario: it replays a LOCAL fixture checked into
+tests/fixtures/<scenario>/ (wav clips + photos listed in manifest.json, produced
+by scripts/export_fixtures.py) — no Weave access needed to fetch anything.
+--thread is the ad-hoc fallback: it downloads each voice_turn's `user_audio`
+(the caller's mic, stored as playable media on the Weave trace) for one
+conversation thread. Either way the events are streamed over the real WebSocket
+mic path exactly as a browser would: 1280-byte PCM chunks every 40 ms
+(real-time pacing — Deepgram's endpointing is time-based, so faster-than-
+realtime would change turn segmentation), a 2 s silence tail per clip so the
+turn closes, waiting out the agent's reply between clips; photos go up as the
+same {type: "image", data: <data URL>} JSON the browser sends.
 
 The replayed session produces brand-new voice_turn traces carrying the SAME
 caller audio — which is what makes this the dataset source for audio-path
 evaluations (docs/evals/proposal.md): monitors, scorers, judge prompts, or
 pipeline changes can be re-tested against identical input without anyone
-re-acting the conversation. Requires WEAVE/WANDB to be configured (the clips
-come from the trace store).
+re-acting the conversation. Only --thread requires WEAVE/WANDB to be configured
+(the clips come from the trace store); --scenario reads everything from disk.
 """
 import argparse
 import asyncio
+import base64
 import io
 import json
+import mimetypes
 import os
 import sys
 import wave
@@ -34,17 +42,51 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-import weave
 import websockets
 
 from server.config import WANDB_ENTITY, WANDB_PROJECT
 
 URL = os.environ.get("VRA_WS_URL", "ws://127.0.0.1:8000/ws")
+FIXTURES = ROOT / "tests" / "fixtures"
+
+
+def list_scenarios() -> list[str]:
+    """The local fixture scenarios available under tests/fixtures/."""
+    return sorted(p.parent.name for p in FIXTURES.glob("*/manifest.json"))
+
+
+def load_scenario(name: str) -> list[dict]:
+    """The events of one local fixture scenario, files loaded from disk:
+    audio -> {"type": "audio", "wav": bytes, "label": transcript} and
+    image -> {"type": "image", "data_url": str, "label": filename}."""
+    folder = FIXTURES / name
+    manifest_path = folder / "manifest.json"
+    if not manifest_path.exists():
+        avail = ", ".join(list_scenarios()) or "none (run scripts/export_fixtures.py)"
+        raise SystemExit(f"no manifest at {manifest_path}; available scenarios: {avail}")
+    manifest = json.loads(manifest_path.read_text())
+    events = []
+    for ev in manifest["events"]:
+        blob = (folder / ev["file"]).read_bytes()
+        if ev["type"] == "audio":
+            events.append({"type": "audio", "wav": blob,
+                           "label": ev.get("transcript") or ev["file"]})
+        elif ev["type"] == "image":
+            # Encode exactly as the browser does (static/app.js): a base64 data URL.
+            mime = mimetypes.guess_type(ev["file"])[0] or "image/jpeg"
+            events.append({"type": "image", "label": ev["file"],
+                           "data_url": f"data:{mime};base64,{base64.b64encode(blob).decode()}"})
+        else:
+            raise SystemExit(f"unknown event type {ev['type']!r} in {manifest_path}")
+    print(f"scenario {name}: {len(events)} events — {manifest.get('description', '')}")
+    return events
 
 
 def fetch_clips(thread_id: str | None) -> list[tuple[int, bytes]]:
     """The (turn_id, wav_bytes) clips of one thread, oldest first. Defaults to the
     newest thread that has voice_turn calls with recorded caller audio."""
+    import weave  # deferred: only --thread mode talks to the trace store
+
     client = weave.init(f"{WANDB_ENTITY}/{WANDB_PROJECT}")
     # Filter by op SERVER-side: a recency-window fetch silently returns zero
     # clips for older threads once the project holds many calls (each turn also
@@ -82,7 +124,7 @@ def wav_to_pcm16k(wav_bytes: bytes) -> bytes:
         return w.readframes(w.getnframes())
 
 
-async def replay(clips: list[tuple[int, bytes]]) -> None:
+async def replay(items: list[dict]) -> None:
     async with websockets.connect(URL, max_size=None) as ws:
         events: list[dict] = []
 
@@ -97,13 +139,35 @@ async def replay(clips: list[tuple[int, bytes]]) -> None:
                     if pred(ev):
                         return ev
 
+        def turn_over(e):
+            return (e["type"] == "state" and e["state"] == "listening") \
+                or e["type"] == "call_ended"
+
         # The agent greets first; wait until it's listening.
         await pump_until(lambda e: e["type"] == "state" and e["state"] == "listening")
-        print(f"greeting done, replaying {len(clips)} clips")
+        print(f"greeting done, replaying {len(items)} events")
 
-        for turn_id, wav in clips:
-            pcm = wav_to_pcm16k(wav) + b"\x00" * 16000 * 2 * 2  # 2s tail -> endpoint
-            print(f"  clip (orig turn {turn_id}): {len(pcm) / 32000:.1f}s ... ",
+        for n, item in enumerate(items):
+            if item["type"] == "image":
+                # Same JSON the browser sends from the photo picker (static/app.js).
+                await ws.send(json.dumps({"type": "image", "data": item["data_url"]}))
+                print(f"  image {item['label']} sent", end="", flush=True)
+                nxt = items[n + 1] if n + 1 < len(items) else None
+                if nxt is None or nxt["type"] == "image":
+                    # No speech rides with this photo: the server auto-sends a lone
+                    # image after IMAGE_AUTOSEND_S (2 s) of silence — wait that out,
+                    # then wait for the agent's reply to finish.
+                    print(" ... waiting for image auto-send turn", end="", flush=True)
+                    await asyncio.sleep(3.5)
+                    ev = await pump_until(turn_over)
+                    if ev["type"] == "call_ended":
+                        print(" call ended by agent")
+                        return
+                print()
+                continue
+
+            pcm = wav_to_pcm16k(item["wav"]) + b"\x00" * 16000 * 2 * 2  # 2s tail -> endpoint
+            print(f"  clip {item['label'][:48]!r}: {len(pcm) / 32000:.1f}s ... ",
                   end="", flush=True)
 
             async def mic_pump():
@@ -113,9 +177,7 @@ async def replay(clips: list[tuple[int, bytes]]) -> None:
 
             pump = asyncio.create_task(mic_pump())
             try:
-                ev = await pump_until(
-                    lambda e: (e["type"] == "state" and e["state"] == "listening")
-                    or e["type"] == "call_ended")
+                ev = await pump_until(turn_over)
             finally:
                 pump.cancel()
             if ev["type"] == "call_ended":
@@ -128,9 +190,25 @@ async def replay(clips: list[tuple[int, bytes]]) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--thread", help="Weave thread id to replay (default: newest)")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--scenario", metavar="NAME",
+                      help="local fixture scenario under tests/fixtures/ (primary mode)")
+    mode.add_argument("--thread", metavar="ID",
+                      help="Weave thread id to fetch and replay (ad-hoc fallback)")
     args = ap.parse_args()
-    clips = fetch_clips(args.thread)
-    if not clips:
-        raise SystemExit("no clips to replay")
-    asyncio.run(replay(clips))
+    if args.scenario:
+        items = load_scenario(args.scenario)
+    elif args.thread:
+        items = [{"type": "audio", "wav": wav, "label": f"orig turn {turn_id}"}
+                 for turn_id, wav in fetch_clips(args.thread)]
+    else:
+        ap.print_help()
+        names = list_scenarios()
+        print("\navailable scenarios:" if names else
+              "\nno scenarios under tests/fixtures/ (produce them with scripts/export_fixtures.py)")
+        for name in names:
+            print(f"  --scenario {name}")
+        sys.exit(0)
+    if not items:
+        raise SystemExit("no events to replay")
+    asyncio.run(replay(items))

@@ -25,9 +25,14 @@ quick reference). Read in order:
    off the hot path) and one voice turn as a timeline, through to the vocal judge
    and the Weave trace.
 6. **[06-weights-and-biases.md](06-weights-and-biases.md)** — the W&B integration in
-   practice: what each `voice_turn` trace carries, where to look in the Weave UI,
-   why transcript quality is a zero-code Monitor but acoustic emotion had to be an
-   in-process judge, and the config knobs.
+   practice: what each `voice_turn` trace carries, where to look in the Weave UI
+   (Traces/Threads and the Agents view), why transcript quality is a zero-code
+   Monitor but acoustic emotion had to be an in-process judge, and the config knobs.
+7. **[07-trace-shaping.md](07-trace-shaping.md)** — trace shaping: one turn, two
+   observability stores. Field-by-field maps of the Weave `voice_turn` tree and the
+   Agent Lens `invoke_agent` turn (where each field is set and why it's shaped that
+   way), the rules learned the hard way, and prescriptive advice for instrumenting
+   a new realtime agent.
 
 ## Strategy & research notes
 

@@ -1,0 +1,66 @@
+{
+  "name": "happy_path",
+  "description": "Ice maker fault: basics walkthrough, photo of the unit, engineer booking, polite goodbye.",
+  "source_thread": "89922bd19e5a41f5b7a878998dde6f00",
+  "exported_at": "2026-11-14",
+  "events": [
+    {
+      "type": "audio",
+      "file": "clip_01.wav",
+      "transcript": "Hi, Alex. I'm having trouble on my ice maker."
+    },
+    {
+      "type": "audio",
+      "file": "clip_02.wav",
+      "transcript": "It's just not turning on."
+    },
+    {
+      "type": "audio",
+      "file": "clip_03.wav",
+      "transcript": "I think it might be better if I give you a photo and you can check."
+    },
+    {
+      "type": "image",
+      "file": "IMG_3341.jpeg"
+    },
+    {
+      "type": "audio",
+      "file": "clip_04.wav",
+      "transcript": "Can you see if the power is on for the ice maker?"
+    },
+    {
+      "type": "audio",
+      "file": "clip_05.wav",
+      "transcript": "The other one next to it works, but maybe you should look at the switches in the photo and see if one is on and one is off."
+    },
+    {
+      "type": "audio",
+      "file": "clip_06.wav",
+      "transcript": "It's turned on. Yes."
+    },
+    {
+      "type": "audio",
+      "file": "clip_07.wav",
+      "transcript": "I believe so. Let me show you another thing I'm trying, and you can tell me if it's a good idea."
+    },
+    {
+      "type": "audio",
+      "file": "clip_08.wav",
+      "transcript": "Yes. I would. But can you book a human engineer for me?"
+    },
+    {
+      "type": "audio",
+      "file": "clip_09.wav",
+      "transcript": "This Monday at 02:00. Works, and, yes, that's the issue."
+    },
+    {
+      "type": "audio",
+      "file": "clip_10.wav",
+      "transcript": "No. That's fine. Thank you very much."
+    }
+  ],
+  "extra_images": [
+    "IMG_3340.jpeg",
+    "IMG_3342.jpeg"
+  ]
+}
