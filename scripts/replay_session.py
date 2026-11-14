@@ -46,8 +46,12 @@ def fetch_clips(thread_id: str | None) -> list[tuple[int, bytes]]:
     """The (turn_id, wav_bytes) clips of one thread, oldest first. Defaults to the
     newest thread that has voice_turn calls with recorded caller audio."""
     client = weave.init(f"{WANDB_ENTITY}/{WANDB_PROJECT}")
+    # Filter by op SERVER-side: a recency-window fetch silently returns zero
+    # clips for older threads once the project holds many calls (each turn also
+    # logs judge/scorer/child calls that crowd out the window).
     calls = list(client.get_calls(
-        sort_by=[{"field": "started_at", "direction": "desc"}], limit=200))
+        filter={"op_names": [f"weave:///{WANDB_ENTITY}/{WANDB_PROJECT}/op/voice_turn:*"]},
+        sort_by=[{"field": "started_at", "direction": "desc"}], limit=2000))
     turns = [c for c in calls if "voice_turn" in str(c.op_name)]
     if thread_id is None:
         if not turns:
