@@ -35,11 +35,10 @@ Open the URL in **Chrome**, click **Start call**, grant the mic, and **use headp
 
 **Where your traces go.** With a `WANDB_API_KEY` set, also set **`WANDB_ENTITY`** and
 **`WANDB_PROJECT`** in `.env` so traces, Threads, and Agent Lens land in *your* own W&B
-workspace. The default project is the maintainer's reference project — the one behind the
-screenshots in these docs —
-[`wandb-smle/jb_voice_deepgram_agent`](https://forge.coreweave.com/wandb/wandb-smle/jb_voice_deepgram_agent/weave);
-your key can view it but not write to it, so point the two vars at your own entity to see
-your own calls.
+workspace (otherwise a `voice-repair-agent` project is created under your default
+entity). To see what a populated project looks like first, browse the reference project
+these docs' screenshots come from:
+[`wandb-smle/jb_voice_deepgram_agent`](https://forge.coreweave.com/wandb/wandb-smle/jb_voice_deepgram_agent/weave).
 
 ## Configuration
 
