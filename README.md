@@ -58,9 +58,11 @@ uv run python -m server.stt      # standalone STT smoke test (loops TTS audio in
 ```
 
 New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
-pieces link together in diagrams, and
+pieces link together in diagrams,
 [docs/06-weights-and-biases.md](docs/06-weights-and-biases.md) explains the W&B Weave
-integration. The full explainer series lives in [docs/](docs/README.md).
+integration, and [docs/07-trace-shaping.md](docs/07-trace-shaping.md) maps the two
+per-turn telemetry shapes (Weave `voice_turn` traces and the Agent Lens turns) field
+by field. The full explainer series lives in [docs/](docs/README.md).
 
 ## Configuration
 
@@ -84,6 +86,9 @@ accept `0`/`false`/`no` as off):
 | Vocal judge | `VOCAL_JUDGE_ENABLED` | `1` | per-turn acoustic frustration/fear verdict on the caller's mic audio |
 | Vocal judge | `VOCAL_JUDGE_MODEL` | `gpt-audio-mini` | OpenAI audio model doing the judging |
 | Vocal judge | `VOCAL_JUDGE_TIMEOUT_S` | `8.0` | judge deadline; on timeout the trace ships without vocal flags |
+| Agent Lens | `AGENT_LENS_ENABLED` | `1` | emit each turn to the Forge Agents view (Agent Lens) as a conversation turn with audio bubbles |
+| Agent Lens | `AGENT_NAME` | `repair-agent` | the agent entity the turns file under in the Agents tab |
+| Agent Lens | `AGENT_VERSION` | `dev` | version label on the emitted turns (cross-deploy comparison) |
 
 \* `STT_ENDPOINTING_MS` is a constant in `config.py` (edit the file), not an env var —
 it's a product decision, not a deploy-time setting (see Production considerations §1).

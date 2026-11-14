@@ -27,13 +27,14 @@ flowchart LR
         subgraph Obs["observability — OFF the hot path"]
             VJ["vocal_judge.py<br/>acoustic emotion verdict"]
             WT["weave_trace.py<br/>builds the voice_turn span tree"]
+            AL["agent_lens.py<br/>invoke_agent turn + audio bubbles"]
         end
     end
 
     STT["Deepgram STT<br/>nova-3, streaming"]
     LLM["OpenAI LLM<br/>gpt-4o-mini, streaming + tools"]
     TTS["Deepgram TTS<br/>aura-2, streaming"]
-    WB[("W&amp;B Weave")]
+    WB[("W&amp;B Weave<br/>calls + agent spans")]
 
     MIC -- "one WebSocket:<br/>audio both ways + JSON events" --> S
     CAM --> S
@@ -43,7 +44,9 @@ flowchart LR
     S <--> TTS
     S -. "at the turn boundary" .-> VJ
     VJ -. "verdict" .-> WT
-    WT -. "background flush" .-> WB
+    VJ -. "verdict" .-> AL
+    WT -. "calls store" .-> WB
+    AL -. "agent-spans store (OTLP)" .-> WB
 ```
 
 Reading the map:
@@ -55,9 +58,12 @@ Reading the map:
 - **Solid arrows are the hot path.** All three provider links stream: STT transcribes
   while you're still talking, the LLM streams tokens, TTS synthesizes sentence one
   while the model writes sentence three.
-- **Dotted arrows are the side-channel.** The vocal judge and the Weave trace hang off
-  the session at the turn boundary and flush in the background. Unplug them (no
-  `WANDB_API_KEY`) and the solid arrows don't change at all.
+- **Dotted arrows are the side-channel.** One post-turn background task
+  (`session.py::_judge_and_trace`) fans out: vocal judge → Weave `voice_turn` trace →
+  Agent Lens turn (`agent_lens.py`), the last two landing in two *independent* stores
+  (call traces vs agent spans) correlated by `session_id`. Unplug them (no
+  `WANDB_API_KEY`) and the solid arrows don't change at all. Field-level detail:
+  [doc 07](07-trace-shaping.md).
 
 ## One voice turn, as a timeline
 

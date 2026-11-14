@@ -57,6 +57,24 @@ models reject `response_format` outright, so the schema is guaranteed by a **for
 strict tool call** instead (which also removes the model's "I can't determine…"
 refusal path); and any failure degrades to `null` flags, never a lost trace.
 
+## The Agents view / Agent Lens
+
+On top of the call traces, every finished turn is *also* emitted to the Forge
+**Agents view** (Agent Lens) as an `invoke_agent` span tree via `weave.log_turn`
+(`server/agent_lens.py`) — a separate agent-spans store, fed from the same post-turn
+background task, correlated with the Threads view by `session_id ==
+gen_ai.conversation.id`. Where to look:
+
+- **Conversations** — each call as a chat transcript with per-role **audio bubbles**
+  (caller mic on the user bubble, the agent's reply on the assistant bubble, photos
+  inline); **Play all** replays the entire call.
+- **Spans** — the per-turn `chat`/STT/TTS/`execute_tool` waterfall, with the app's
+  custom `app.*` attributes (latencies, barge-in, vocal flags) as filterable columns.
+- **Signals** — monitors score the emitted turns (`weave.genai.turn_ended`).
+
+The field-level detail — every field, where it's set, and why it's shaped that way,
+for both stores — lives in [doc 07](07-trace-shaping.md).
+
 ## Configuration
 
 All in `server/config.py`, env-overridable (booleans accept `0`/`false`/`no`):
@@ -67,6 +85,9 @@ All in `server/config.py`, env-overridable (booleans accept `0`/`false`/`no`):
 | `WANDB_PROJECT` | `jb_voice_deepgram_agent` | W&B project the traces ship to |
 | `WEAVE_ENABLED` | `1` | master switch for tracing |
 | `WEAVE_CAPTURE_MEDIA` | `1` | attach photo + both audio streams to each turn |
+| `AGENT_LENS_ENABLED` | `1` | emit each turn to the Agents view (Agent Lens) |
+| `AGENT_NAME` | `repair-agent` | the agent entity in the Agents tab |
+| `AGENT_VERSION` | `dev` | version label for cross-deploy comparison |
 
 Without `WANDB_API_KEY` in `.env` (get one at <https://wandb.ai/authorize>) the whole
 layer — tracer, media capture, vocal judge output — degrades to a **no-op** and the
