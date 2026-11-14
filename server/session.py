@@ -57,7 +57,7 @@ from openai import AsyncOpenAI
 from . import llm
 from .agent import build_system_prompt
 from .agent_lens import log_agent_turn
-from .config import (BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
+from .config import (BARGE_IN_MIN_WORDS, BARGE_IN_ON_VAD, BARGE_IN_VAD_GRACE_MS,
                      CONTEXT_KEEP_RECENT_MESSAGES, CONTEXT_MAX_HISTORY_TOKENS,
                      DEFAULT_IMAGE_PROMPT, IDLE_GOODBYE_PHRASE, IDLE_HANGUP_S,
                      IDLE_PROMPT_PHRASE, IDLE_PROMPT_S, IMAGE_AUTOSEND_S,
@@ -74,6 +74,17 @@ log = logging.getLogger("session")
 # Metric fields we aggregate across a session, in display order.
 _METRIC_FIELDS = ("stt_final_ms", "llm_ttft_ms", "tts_ttfb_ms",
                   "v2v_server_ms", "v2v_client_ms")
+# Extra fields that go to the latency JSON only — never to the browser payload.
+# ubl_ms mirrors Pipecat's UserBotLatencyObserver: user stopped speaking ->
+# bot started speaking (first audio byte written, filler included).
+_LOG_ONLY_METRIC_FIELDS = ("ubl_ms",)
+
+# Marker appended to a truncated assistant message in HISTORY when the customer
+# barged in — the model's memory ends where the customer stopped listening.
+_CUT_MARKER = " [cut off here by the customer]"
+
+# TTS audio is 16-bit mono at TTS_SAMPLE_RATE: bytes -> seconds of playback.
+_TTS_BYTES_PER_S = 2 * TTS_SAMPLE_RATE
 
 
 def _p95(values: list[float]) -> float:
@@ -209,6 +220,26 @@ class Session:
         # THESE — what the user plausibly heard — not the full LLM output, so the
         # model's memory of the call matches the customer's.
         self.spoken_sentences: list[str] = []
+        # Word-pacing bookkeeping (Pipecat-style). Pipecat commits an interrupted
+        # assistant message from TTSTextFrames paced against audio playback (word
+        # pts via WordTimestampTracker, released by base_output.py's clock queue).
+        # Deepgram Aura gives no word timestamps, so we estimate instead: count the
+        # audio bytes received per sentence (bytes -> seconds at _TTS_BYTES_PER_S)
+        # and, on barge-in, pace each sentence's words uniformly across its audio
+        # duration against the wall clock since playback began. See
+        # _estimate_heard_text. Counters are O(1) integer adds per audio chunk —
+        # nothing new on the hot path.
+        self.sentence_audio_bytes: list[int] = []  # per REAL spoken sentence, this turn
+        self.filler_audio_bytes = 0                # image-turn filler audio, this turn
+        self.t_first_audio: float | None = None    # first REAL-reply chunk forwarded
+        # UserBotLatencyObserver-style timestamps (Pipecat observers/
+        # user_bot_latency_observer.py): user stopped speaking -> bot started
+        # speaking, where "bot started speaking" = first audio byte written to the
+        # browser (filler included — it is audible speech). Logged per turn as
+        # ubl_ms (latency JSON only) + an avg/min/max/p95 summary at session close,
+        # mirroring Pipecat's UserBotLatencyLogObserver log lines.
+        self.t_first_audio_any: float | None = None
+        self.ubl_values: list[float] = []
 
         # TTS bookkeeping for the current turn
         self.speaks_sent = 0        # Speak messages sent
@@ -312,6 +343,7 @@ class Session:
                 # Flush this session's latency record. Never let a logging failure
                 # propagate out of teardown.
                 try:
+                    self._log_ubl_summary()
                     self._write_latency_log()
                 except Exception:
                     log.exception("failed to write latency log")
@@ -366,6 +398,20 @@ class Session:
                 # transcript proves it's the user, not the agent's own echo or room noise
                 # (which may still have pre-armed VAD above but can never fire on its own).
                 if self.state is not State.LISTENING:
+                    # Min-words interruption gate — Pipecat's
+                    # MinWordsUserTurnStartStrategy(min_words, use_interim=True): while
+                    # the bot is speaking, a transcript commits the interrupt only once
+                    # it carries >= BARGE_IN_MIN_WORDS words. Like Pipecat, each event
+                    # (interim or final) is counted whole — Deepgram interims carry the
+                    # utterance-so-far — and sub-threshold speech is dropped, mirroring
+                    # Pipecat's trigger_reset_aggregation (a backchannel "uh-huh" never
+                    # interrupts and never leaks into the next turn). The gate exists
+                    # ONLY here, on the barge-in commit: normal turn-taking (agent
+                    # LISTENING) is unaffected. Default 1 = any speech interrupts
+                    # (exactly the pre-gate behavior).
+                    if len(event.text.split()) < BARGE_IN_MIN_WORDS:
+                        self.utterance_parts.clear()
+                        continue
                     if self._vad_pre_armed:
                         log.info("barge-in confirmed by transcript (VAD pre-armed %d ms earlier)",
                                  round((time.monotonic() - self._t_vad_pre_arm) * 1000))
@@ -431,13 +477,34 @@ class Session:
                     now = time.monotonic()
                     self.metrics.tts_ttfb_ms = round((now - self.t_first_speak) * 1000)
                     self.metrics.v2v_server_ms = round((now - self.t_turn_end) * 1000)
-                # Capture the agent's audio for the trace, split into two streams. The
-                # filler (image turns) is spoken first and its Flushed ack lands before
-                # the real reply's first chunk — the same gate the TTFB metric uses — so
-                # flushed_received separates filler audio from the real reply. A scripted
-                # turn (greeting / idle) has no self.tt: all of its audio is canned.
+                # The filler (image turns) is spoken first and its Flushed ack lands
+                # before the real reply's first chunk — the same gate the TTFB metric
+                # uses — so flushed_received separates filler audio from the real reply.
+                is_filler = self.has_filler and self.flushed_received == 0
+                if self.t_first_audio_any is None:
+                    # Bot started speaking (first audible byte, filler included):
+                    # Pipecat UserBotLatencyObserver's BotStartedSpeakingFrame moment.
+                    self.t_first_audio_any = time.monotonic()
+                    if self.metrics and not self.idle_turn and self.t_turn_end:
+                        self._record_ubl(self.metrics.turn_id,
+                                         self.t_first_audio_any - self.t_turn_end)
+                if is_filler:
+                    self.filler_audio_bytes += len(event.data)
+                else:
+                    # Per-sentence audio byte counts for word-pacing on barge-in
+                    # (see _estimate_heard_text). Audio for sentence N arrives
+                    # strictly between Flushed acks N-1 and N (one Flush per
+                    # sentence on one socket), so flushed_received indexes it.
+                    if self.t_first_audio is None:
+                        self.t_first_audio = time.monotonic()
+                    idx = self.flushed_received - (1 if self.has_filler else 0)
+                    while len(self.sentence_audio_bytes) <= idx:
+                        self.sentence_audio_bytes.append(0)
+                    self.sentence_audio_bytes[idx] += len(event.data)
+                # Capture the agent's audio for the trace, split into two streams. A
+                # scripted turn (greeting / idle) has no self.tt: its audio is canned.
                 if self.trace.capture_media:
-                    if self.has_filler and self.flushed_received == 0:
+                    if is_filler:
                         self._sys_tts_buf.extend(event.data)         # image-turn filler
                     elif self.tt is None and self._pending_sys_utt is not None:
                         self._sys_tts_buf.extend(event.data)         # greeting / idle
@@ -460,6 +527,12 @@ class Session:
         self._mark_activity()
         self._cancel_image_autosend()  # typed turn will consume any pending photo
         if self.state is not State.LISTENING:
+            # Same min-words interruption gate as the STT path (Pipecat
+            # MinWordsUserTurnStartStrategy semantics): typed input is a synthetic
+            # transcript, so a sub-threshold message may not cut the agent off either.
+            # Default 1 = any text interrupts (the pre-gate behavior).
+            if len(text.split()) < BARGE_IN_MIN_WORDS:
+                return
             await self._barge_in()
         self.t_last_transcript = time.monotonic()  # typed "speech" ends now
         self.utterance_parts = [text]
@@ -497,6 +570,10 @@ class Session:
         self.speaks_sent = self.flushes_sent = self.flushed_received = 0
         self.llm_done = False
         self.spoken_sentences = []
+        self.sentence_audio_bytes = []
+        self.filler_audio_bytes = 0
+        self.t_first_audio = None
+        self.t_first_audio_any = None
         self.has_filler = False           # set True if an image-turn filler is spoken
         self.t_first_speak = None         # set on the first REAL (recorded) speak
         self._vad_pre_armed = False       # fresh turn: no VAD onset seen yet
@@ -645,15 +722,17 @@ class Session:
         except asyncio.CancelledError:
             # Barge-in or session teardown cancelled us mid-stream. agent_reply never
             # got to append its assistant message, so record one ourselves containing
-            # only what was actually SENT TO TTS — the model's memory of the call
-            # should match what the customer heard, not what was silently generated.
-            spoken = " ".join(self.spoken_sentences).strip()
+            # only what the customer plausibly HEARD — Pipecat-style: the estimated
+            # word playback had reached when we were cut (sentences merely queued to
+            # TTS but not yet played never enter the context, exactly like Pipecat's
+            # unreleased TTSTextFrames). See _estimate_heard_text.
+            spoken = self._estimate_heard_text()
             if not (self.messages and self.messages[-1].get("role") == "assistant"):
                 # (if the last message is already an assistant one, agent_reply
                 # finished its append just before we were cancelled — don't duplicate)
                 self.messages.append({
                     "role": "assistant",
-                    "content": (spoken + " [cut off here by the customer]") if spoken
+                    "content": (spoken + _CUT_MARKER) if spoken
                                else "[reply interrupted by the customer before speaking]",
                 })
             with contextlib.suppress(Exception):
@@ -982,6 +1061,63 @@ class Session:
 
     # ------------------------------------------------------------------ barge-in
 
+    def _estimate_heard_text(self) -> str:
+        """Word-level estimate of how much of this turn's reply the customer actually
+        HEARD before barging in. Mirrors Pipecat's interruption-truncation design: there
+        the assistant context is built from TTSTextFrames the output transport releases
+        in pace with audio playback (word-timestamp pts via WordTimestampTracker,
+        tts_service.py, slept out by base_output.py's clock queue), so an interrupted
+        turn commits only words already played. Deepgram Aura gives no word timestamps
+        (Pipecat would fall back to whole sentences, like our old code), so we
+        reconstruct the pacing: each sentence's audio byte count gives its playback
+        duration, the wall clock since the first audio byte was written gives how much
+        has played, and the words of the partially-played sentence are spread uniformly
+        across its duration.
+
+        Deliberately conservative, like Pipecat's queue semantics (unplayed text never
+        reaches the context):
+          - never claims beyond the sentences whose audio was flushed (today's
+            sentence-level bound) — the pace walk just cuts WITHIN that bound;
+          - the word cut is floored, and audio-send time is used as playback start
+            (the client starts playing almost immediately but can only consume in
+            real time, which is exactly the gap this estimate closes).
+        Returns "" when nothing can have been heard yet. Runs only at barge-in —
+        nothing here is on the voice hot path."""
+        if not self.spoken_sentences or self.t_first_audio is None:
+            return ""
+        # Playback of the REAL reply starts after any image-turn filler finishes
+        # playing (the filler is audible speech occupying the same output stream).
+        start = self.t_first_audio
+        if self.has_filler and self.t_first_audio_any is not None:
+            start = max(start, self.t_first_audio_any
+                        + self.filler_audio_bytes / _TTS_BYTES_PER_S)
+        budget = time.monotonic() - start   # seconds of real reply played so far
+        if budget <= 0:
+            return ""
+        # Sentence-level upper bound — identical slice to the pre-upgrade behavior
+        # ("never claim MORE than was flushed"). flushed_received counts the filler's
+        # flush too, so discount it on image turns.
+        real_flushed = self.flushed_received - (1 if self.has_filler else 0)
+        eligible = self.spoken_sentences[:max(1, real_flushed)]
+        heard: list[str] = []
+        for i, sentence in enumerate(eligible):
+            duration = (self.sentence_audio_bytes[i] / _TTS_BYTES_PER_S
+                        if i < len(self.sentence_audio_bytes) else 0.0)
+            if duration <= 0.0:
+                break                       # no audio received yet -> not played
+            words = sentence.split()
+            if budget >= duration:
+                heard.extend(words)         # sentence fully played
+                budget -= duration
+                continue
+            heard.extend(words[:int(len(words) * budget / duration)])
+            break
+        if not heard:
+            # Playback HAS started (budget > 0): the customer heard something —
+            # claim at least the first word.
+            heard = eligible[0].split()[:1]
+        return " ".join(heard)
+
     async def _barge_in(self) -> None:
         """The user spoke while the agent was thinking/speaking. Kill everything
         in flight, in this order (each step is one place stale output could leak):
@@ -1017,12 +1153,21 @@ class Session:
         elif (self.spoken_sentences and self.messages
               and self.messages[-1].get("role") == "assistant"):
             # The LLM had already finished (full reply in history) but the AUDIO was
-            # cut mid-playback. Truncate the stored reply to the sentences whose audio
-            # was fully delivered — the model's memory should match what the customer
-            # heard, not what was generated. (Best server-side proxy; true playback
-            # position lives in the client's ring buffer.)
-            heard = " ".join(self.spoken_sentences[:max(1, self.flushed_received)])
-            self.messages[-1]["content"] = heard + " [cut off here by the customer]"
+            # cut mid-playback. Truncate the stored reply to the estimated WORD the
+            # playback reached (Pipecat-style paced truncation, _estimate_heard_text) —
+            # the model's memory should match what the customer heard, not what was
+            # generated. Falls back to the sentence-level flushed bound if the pace
+            # estimate claims nothing. (Best server-side proxy; true playback position
+            # lives in the client's ring buffer.)
+            heard = (self._estimate_heard_text()
+                     or " ".join(self.spoken_sentences[:max(1, self.flushed_received)]))
+            self.messages[-1]["content"] = heard + _CUT_MARKER
+        if (self.messages and self.messages[-1].get("role") == "assistant"
+                and str(self.messages[-1].get("content", "")).endswith(_CUT_MARKER)):
+            # Observability for the word-level cut (off the hot path: barge-ins only).
+            log.info("barge-in: history keeps %r (%d of %d sentences fully flushed)",
+                     self.messages[-1]["content"], self.flushed_received,
+                     self.flushes_sent)
         if self.speaks_sent:
             # Stop Deepgram synthesizing/sending the rest; whatever is already in
             # flight gets dropped by the tts_turn tag check in _tts_rx.
@@ -1055,6 +1200,27 @@ class Session:
             if value is not None:
                 row[field] = value
 
+    def _record_ubl(self, turn_id: int, seconds: float) -> None:
+        """One user-stop -> bot-first-audio latency sample (Pipecat's
+        UserBotLatencyLogObserver, observers/loggers/user_bot_latency_log_observer.py:
+        per-turn debug line + session-end summary). Latency-JSON and log ONLY — the
+        TurnMetrics wire payload to the browser is untouched."""
+        ubl_ms = round(seconds * 1000)
+        self.turn_metrics.setdefault(turn_id, {})["ubl_ms"] = ubl_ms
+        self.ubl_values.append(ubl_ms)
+        log.debug("turn %d user->bot latency: %d ms", turn_id, ubl_ms)
+
+    def _log_ubl_summary(self) -> None:
+        """Session-close summary, mirroring Pipecat UserBotLatencyLogObserver's
+        avg/min/max line on EndFrame/CancelFrame (plus p95, this repo's house stat)."""
+        if not self.ubl_values:
+            return
+        log.info("user->bot latency (user stopped speaking -> bot started speaking) - "
+                 "avg: %d ms, min: %d ms, max: %d ms, p95: %d ms (%d turns)",
+                 round(statistics.fmean(self.ubl_values)), min(self.ubl_values),
+                 max(self.ubl_values), round(_p95(self.ubl_values)),
+                 len(self.ubl_values))
+
     def _write_latency_log(self) -> None:
         """Write this session's per-turn + aggregate latency to a timestamped JSON
         file. Called once on teardown. No-op for sessions with no recorded turns."""
@@ -1066,7 +1232,7 @@ class Session:
         per_turn = [{"turn_id": tid, **self.turn_metrics[tid]} for tid in sorted(turns)]
 
         overall = {}
-        for field in _METRIC_FIELDS:
+        for field in _METRIC_FIELDS + _LOG_ONLY_METRIC_FIELDS:
             values = [m[field] for m in self.turn_metrics.values() if m.get(field) is not None]
             if not values:
                 overall[field] = {"count": 0}

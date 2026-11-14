@@ -108,6 +108,7 @@ The tunables (booleans accept `0`/`false`/`no` as off):
 | STT / latency | `STT_ENDPOINTING_MS` * | `300` | silence (ms) that ends a user turn — THE latency/accuracy dial |
 | Barge-in | `BARGE_IN_ON_VAD` | `1` | let a VAD speech onset pre-arm interruption (transcript still commits it) |
 | Barge-in | `BARGE_IN_VAD_GRACE_MS` | `250` | ignore VAD onsets this long after the agent starts speaking |
+| Barge-in | `BARGE_IN_MIN_WORDS` | `1` | words a transcript needs before it may interrupt the speaking agent (Pipecat's `MinWordsUserTurnStartStrategy`; `1` = any speech interrupts, higher ignores backchannels like "uh-huh") |
 | Images | `IMAGE_AUTOSEND_S` | `2.0` | a lone photo (no speech) auto-starts a turn after this many seconds |
 | Idle timeout | `IDLE_PROMPT_S` | `15` | silence before the "are you still there?" nudge |
 | Idle timeout | `IDLE_HANGUP_S` | `25` | further silence before goodbye + hang-up |

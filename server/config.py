@@ -41,6 +41,17 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         raise SystemExit(f"config: {name}={raw!r} is not a number") from None
 
+
+def _env_int(name: str, default: int) -> int:
+    """Integer env override; a malformed value fails LOUDLY at import, not mid-call."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise SystemExit(f"config: {name}={raw!r} is not an integer") from None
+
 # ---------------------------------------------------------------- speech-to-text
 STT_MODEL = "nova-3"          # Deepgram's streaming STT model
 STT_SAMPLE_RATE = 16000       # browser downsamples mic to this; 16 kHz is plenty for speech
@@ -70,6 +81,17 @@ BARGE_IN_ON_VAD = _env_bool("BARGE_IN_ON_VAD", True)
 # ramp-up at speech onset. (Correctness no longer depends on this — a VAD onset can't
 # interrupt on its own regardless — it only reduces spurious pre-arm bookkeeping.)
 BARGE_IN_VAD_GRACE_MS = _env_float("BARGE_IN_VAD_GRACE_MS", 250)
+# Minimum words a user transcript (interim or final) must carry before it COMMITS a
+# barge-in while the agent is thinking/speaking — a mirror of Pipecat's
+# MinWordsUserTurnStartStrategy(min_words=N, use_interim=True): while the bot is
+# speaking, short backchannels ("yeah", "uh-huh") shouldn't cut it off, and
+# sub-threshold speech is dropped (Pipecat resets the user aggregation). Each
+# transcript event is counted whole (interims carry the utterance-so-far), exactly
+# like Pipecat's per-frame count_spoken_words. Applies ONLY to the barge-in commit —
+# normal turn-taking while the agent is listening always starts on any speech
+# (Pipecat uses min_words=1 whenever the bot is NOT speaking). Default 1 = any
+# non-empty transcript interrupts, i.e. exactly today's behavior.
+BARGE_IN_MIN_WORDS = _env_int("BARGE_IN_MIN_WORDS", 1)
 
 # ---------------------------------------------------------------- language model
 LLM_MODEL = "gpt-4o-mini"     # low-latency, cheap; voice agents live and die on TTFT
