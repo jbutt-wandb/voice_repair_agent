@@ -133,6 +133,14 @@ On top of the traces, a server-side **Monitor** (LLM-judge) tags every turn's
 transcript for frustration/NSFW/jailbreaking, and a mirrored **Signal** does the same
 on the Agents side. Everything degrades to a no-op without `WANDB_API_KEY`.
 
+The **vocal judge** is the acoustic counterpart to that transcript monitor: it listens
+to the caller's audio, not their words. Someone can say "that's fine, thanks" through
+gritted teeth — the transcript looks calm while the voice is clearly stressed. The judge
+catches that from tone, pace, and strain and logs `vocal_frustrated` / `vocal_fearful`
+flags onto the turn in W&B, so a problem the text would miss is still visible and
+filterable. (It runs in-process because W&B monitors can't read the trace's audio — see
+doc 06.)
+
 Two docs go deeper: [doc 06](docs/06-weights-and-biases.md) is the practical map, with
 screenshots (what's traced, where to look, monitors vs the in-process acoustic judge);
 [doc 07](docs/07-trace-shaping.md) is the field-by-field contract for both stores, plus
