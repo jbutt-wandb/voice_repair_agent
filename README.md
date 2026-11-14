@@ -50,8 +50,10 @@ these docs' screenshots come from:
 
 A *knob* here is any value that changes the agent's behavior — a latency threshold, a
 feature toggle, a model name. Each is commented with the tradeoff it controls in
-[`server/config.py`](server/config.py); the server fails fast on a missing required key
-and logs one `config:` line of the live values at startup. Knobs come in three tiers:
+[`server/config.py`](server/config.py), and the server logs one `config:` line of the
+live values at startup (and fails fast on a missing required key).
+
+Knobs come in three tiers:
 
 - **Secrets** — API keys; `.env` only, never in code (see `.env.example`).
 - **Deploy tunables** — env vars an operator flips per environment (the table below;
@@ -95,10 +97,13 @@ it's a product decision, not a deploy-time setting.
   └────────────────────────────────────────────────┘
 ```
 
-One WebSocket carries everything; each connection gets its own `Session` owning the
+One WebSocket carries everything. Each connection gets its own `Session` that owns the
 three streaming stages and the conversation history (summarized in the background on
-long calls). The governing rule everywhere: **nothing may regress voice-to-voice
-latency** — streaming overlap on the hot path, everything else at the turn boundary.
+long calls).
+
+The governing rule everywhere: **nothing may regress voice-to-voice latency** —
+streaming overlap on the hot path, everything else at the turn boundary.
+
 The full walkthrough — stage by stage, the turn state machine, and why barge-in
 cancellation needs four ordered kills — lives in
 [doc 01](docs/01-how-this-app-works.md) (prose) and
@@ -127,10 +132,11 @@ out to three destinations, all correlated by one id (`session_id`):
 On top of the traces, a server-side **Monitor** (LLM-judge) tags every turn's
 transcript for frustration/NSFW/jailbreaking, and a mirrored **Signal** does the same
 on the Agents side. Everything degrades to a no-op without `WANDB_API_KEY`.
-[Doc 06](docs/06-weights-and-biases.md) is the practical map, with screenshots (what's
-traced, where to look, monitors vs the in-process acoustic judge);
-[doc 07](docs/07-trace-shaping.md) is the field-by-field contract for both stores and
-the from-scratch guide to shaping spans for an event-driven voice app.
+
+Two docs go deeper: [doc 06](docs/06-weights-and-biases.md) is the practical map, with
+screenshots (what's traced, where to look, monitors vs the in-process acoustic judge);
+[doc 07](docs/07-trace-shaping.md) is the field-by-field contract for both stores, plus
+a from-scratch guide to shaping spans for an event-driven voice app.
 
 ## What we're measuring
 
@@ -149,7 +155,9 @@ trace):
 
 **Voice-to-voice is the product metric** — track p50 *and* p95. All fields are
 filterable Weave attributes and Agent Lens columns, so percentiles are a query, not a
-scraper. What production must add on top (WER, task completion, cost/minute) is the
+scraper.
+
+What production must add on top (WER, task completion, cost/minute) is the
 [evaluation proposal](https://github.com/jbutt-wandb/voice_repair_agent/tree/weave_evals)
 on the `weave_evals` branch.
 
@@ -164,12 +172,14 @@ uv run scripts/replay_session.py --scenario frustrated   # frustration + prompt-
 ```
 
 Each scenario streams the original caller's audio through the real mic path at
-real-time pace and sends photos exactly as the browser does; `happy_path` exercises
-vision twice (diagnosis from an outlet photo, refusal of scissors held to a power
-cord). A `manifest.json` per scenario lists the events; `"autosend": true` on an image
-means it is sent with no speech and gets its own turn. No arguments lists scenarios;
-`--thread <id>` replays any traced call ad-hoc; `scripts/export_fixtures.py` turns a
-recorded call into a new scenario.
+real-time pace and sends photos exactly as the browser does. `happy_path` exercises
+vision twice: diagnosis from an outlet photo, then a refusal of scissors held to a power
+cord.
+
+A `manifest.json` per scenario lists the events; `"autosend": true` on an image means
+it is sent with no speech and gets its own turn. Run with no arguments to list
+scenarios, `--thread <id>` to replay any traced call ad-hoc, and
+`scripts/export_fixtures.py` to turn a recorded call into a new scenario.
 
 Also available: `uv run scripts/safety_check.py` (safety eval gate, no server needed),
 `uv run scripts/e2e_check.py` (full-pipeline check incl. a real barge-in, server up).
