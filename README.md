@@ -57,6 +57,26 @@ uv run python -m server.tts      # standalone TTS smoke test
 uv run python -m server.stt      # standalone STT smoke test (loops TTS audio into STT)
 ```
 
+### Replay a recorded call
+
+Two real conversations ship as local fixtures ([`tests/fixtures/`](tests/fixtures/)),
+so anyone can re-run a complete call against the live pipeline — no re-recording,
+fully repeatable:
+
+```bash
+uv run scripts/replay_session.py --scenario happy_path   # fault -> outlet photo -> unsafe idea (agent refuses) -> booking
+uv run scripts/replay_session.py --scenario frustrated   # frustration + prompt-injection attempts -> agent holds the line
+```
+
+Each scenario streams the original caller's recorded audio through the real mic path
+at real-time pace (turn-taking is time-based, so faster would change the behavior
+under test) and sends photos exactly as the browser does. `happy_path` exercises
+vision twice: the agent diagnoses from an outlet photo, then refuses a photo of
+scissors held to the power cord. A `manifest.json` per scenario lists the events —
+`audio` clips (with transcripts for reference) and `image` entries, where
+`"autosend": true` means the photo is sent with no speech and gets its own turn.
+Run with no arguments to list available scenarios.
+
 New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
 pieces link together in diagrams. The full explainer series lives in
 [docs/](docs/README.md).
