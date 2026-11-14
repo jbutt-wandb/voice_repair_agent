@@ -61,6 +61,30 @@ uv run python -m server.tts      # standalone TTS smoke test
 uv run python -m server.stt      # standalone STT smoke test (loops TTS audio into STT)
 ```
 
+### Replay a recorded call
+
+Two real conversations ship as local fixtures ([`tests/fixtures/`](tests/fixtures/)),
+so anyone can re-run a complete call against the live pipeline — no re-recording, no
+remote fetches, fully repeatable:
+
+```bash
+uv run scripts/replay_session.py --scenario happy_path   # fault -> outlet photo -> unsafe idea (agent refuses) -> booking
+uv run scripts/replay_session.py --scenario frustrated   # frustration + prompt-injection attempts -> agent holds the line
+```
+
+Each scenario streams the original caller's recorded audio through the real mic path
+at real-time pace (turn-taking is time-based, so faster would change the behavior
+under test) and sends photos exactly as the browser does. `happy_path` exercises
+vision twice: the agent diagnoses from an outlet photo, then refuses a photo of
+scissors held to the power cord. A `manifest.json` per scenario lists the events —
+`audio` clips (with transcripts for reference) and `image` entries, where
+`"autosend": true` means the photo is sent with no speech and gets its own turn.
+
+Run with no arguments to list available scenarios. To turn any future recorded call
+into a new scenario, use `scripts/export_fixtures.py` (pulls a call's audio from its
+traces, trims leading silence, writes clips + manifest); `--thread <id>` replays any
+traced call ad-hoc without exporting.
+
 New to the codebase? [docs/05-architecture.md](docs/05-architecture.md) shows how the
 pieces link together in diagrams,
 [docs/06-weights-and-biases.md](docs/06-weights-and-biases.md) explains the W&B Weave
