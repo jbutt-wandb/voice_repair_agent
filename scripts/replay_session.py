@@ -44,7 +44,7 @@ load_dotenv(ROOT / ".env")
 
 import websockets
 
-from server.config import WANDB_ENTITY, WANDB_PROJECT
+from server.config import WEAVE_TARGET
 
 URL = os.environ.get("VRA_WS_URL", "ws://127.0.0.1:8000/ws")
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -88,12 +88,12 @@ def fetch_clips(thread_id: str | None) -> list[tuple[int, bytes]]:
     newest thread that has voice_turn calls with recorded caller audio."""
     import weave  # deferred: only --thread mode talks to the trace store
 
-    client = weave.init(f"{WANDB_ENTITY}/{WANDB_PROJECT}")
+    client = weave.init(WEAVE_TARGET)
     # Filter by op SERVER-side: a recency-window fetch silently returns zero
     # clips for older threads once the project holds many calls (each turn also
     # logs judge/scorer/child calls that crowd out the window).
     calls = list(client.get_calls(
-        filter={"op_names": [f"weave:///{WANDB_ENTITY}/{WANDB_PROJECT}/op/voice_turn:*"]},
+        filter={"op_names": [f"weave:///{client.entity}/{client.project}/op/voice_turn:*"]},
         sort_by=[{"field": "started_at", "direction": "desc"}], limit=2000))
     turns = [c for c in calls if "voice_turn" in str(c.op_name)]
     if thread_id is None:

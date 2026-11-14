@@ -35,6 +35,15 @@ expand the LLM/tool/speak children. The **Threads** tab groups turns by call
 (`session_id` is the thread id) and shows per-thread p50/p99 over the turn metrics —
 the quickest "which call went bad, and on which turn" view.
 
+![Traces tab filtered to voice_turn](images/traces-voice-turns.jpg)
+*The Traces tab filtered to `voice_turn`: one row per turn — playable audio, signal tags, transcript columns.*
+
+![A voice_turn trace opened](images/trace-detail.jpg)
+*One `voice_turn` opened: the span tree (`llm_completion` → `speak`), both audio streams in inputs, vocal flags in output.*
+
+![Threads tab](images/threads.jpg)
+*Threads: one row per call, with turn counts and p50/p99 latency.*
+
 ## Monitors — and what they can't hear
 
 On top of per-turn traces, the project uses a Weave **Monitor** for transcript-level
@@ -44,6 +53,9 @@ It was created entirely in the Monitors UI — zero app code, zero latency, and 
 back-fills over sampled production traffic. For anything judgeable from text, this is
 the right tool: the app ships the data it was already shipping, and the scoring is
 someone else's compute.
+
+![Monitors table](images/monitors.jpg)
+*The Monitors table — Quality-classifiers at 100% sampling; the "Incorrect op ref" cell on the agent-ops monitor is the cosmetic rendering noted below.*
 
 The honest lesson: **monitors can't hear.** Weave's monitor audio scoring only reads
 audio inlined in OpenAI-style `messages` inputs — it cannot read the `weave.Audio`
@@ -78,6 +90,15 @@ gen_ai.conversation.id`. Where to look:
   not a failure), and the Monitors table renders the agent-op literal as "Incorrect
   op ref", which is cosmetic.
 
+![Agent Lens conversation view](images/lens-conversation.jpg)
+*A call in Conversations: user and assistant bubbles, each with its own playable audio, plus per-turn cost and latency. A photo turn appears inline as a "(no speech)" user bubble with the caller's image.*
+
+![Agent Lens spans table](images/lens-spans.jpg)
+*Spans: the per-turn op mix — `invoke_agent`, `chat` (gpt-4o-mini / nova-3 / aura-2), `execute_tool`.*
+
+![Signals feed](images/signals.jpg)
+*Signals: turns tagged by the merged preset — user-frustration and malicious-intent, each with a quoted reason.*
+
 The field-level detail — every field, where it's set, and why it's shaped that way,
 for both stores — lives in [doc 07](07-trace-shaping.md).
 
@@ -87,8 +108,8 @@ All in `server/config.py`, env-overridable (booleans accept `0`/`false`/`no`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WANDB_ENTITY` | `wandb-smle` | W&B entity (team) the traces ship to |
-| `WANDB_PROJECT` | `jb_voice_deepgram_agent` | W&B project the traces ship to |
+| `WANDB_ENTITY` | *(empty — your default entity)* | W&B entity (team) the traces ship to |
+| `WANDB_PROJECT` | `voice-repair-agent` | W&B project the traces ship to (auto-created) |
 | `WEAVE_ENABLED` | `1` | master switch for tracing |
 | `WEAVE_CAPTURE_MEDIA` | `1` | attach photo + both audio streams to each turn |
 | `AGENT_LENS_ENABLED` | `1` | emit each turn to the Agents view (Agent Lens) |

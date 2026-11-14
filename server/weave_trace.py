@@ -54,8 +54,8 @@ import io
 import logging
 import wave
 
-from .config import (STT_SAMPLE_RATE, TTS_SAMPLE_RATE, WANDB_ENTITY,
-                     WANDB_PROJECT, WEAVE_CAPTURE_MEDIA, WEAVE_ENABLED)
+from .config import (STT_SAMPLE_RATE, TTS_SAMPLE_RATE, WEAVE_CAPTURE_MEDIA,
+                     WEAVE_ENABLED, WEAVE_TARGET)
 
 log = logging.getLogger("weave_trace")
 
@@ -79,11 +79,11 @@ def init_weave() -> None:
         return
     try:
         import weave
-        _client = weave.init(f"{WANDB_ENTITY}/{WANDB_PROJECT}")
+        _client = weave.init(WEAVE_TARGET)
         # Weave auto-patches the OpenAI client on init. We don't want that duplicate
         # (unredacted) span — we record the LLM call ourselves in finish_turn. The call
         # site wraps the live request in suppress_autotrace() to stop the auto span.
-        log.info("weave tracing ON -> %s/%s", WANDB_ENTITY, WANDB_PROJECT)
+        log.info("weave tracing ON -> %s/%s", _client.entity, _client.project)
     except Exception:
         log.exception("weave.init failed; continuing with tracing disabled")
         _client = None

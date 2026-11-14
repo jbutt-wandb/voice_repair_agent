@@ -149,8 +149,13 @@ LATENCY_LOG_DIR = Path(__file__).resolve().parent.parent / "session_logs"
 # for reviewing completed conversations. See server/weave_trace.py. Tracing is
 # built ENTIRELY at the turn boundary (off the voice hot path) and degrades to a
 # no-op when WANDB_API_KEY is missing, so it never affects the live call.
-WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "wandb-smle")
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "jb_voice_deepgram_agent")
+# Where traces ship. Leave WANDB_ENTITY empty to use the API key holder's own
+# default entity — the zero-config path for a new user: set WANDB_API_KEY and
+# traces land in YOUR workspace. Set both to target a shared team project.
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "voice-repair-agent")
+# weave.init target: "entity/project", or bare "project" (= your default entity).
+WEAVE_TARGET = f"{WANDB_ENTITY}/{WANDB_PROJECT}" if WANDB_ENTITY else WANDB_PROJECT
 # Master switch (env "0"/"false" to disable even when a key is present).
 WEAVE_ENABLED = _env_bool("WEAVE_ENABLED", True)
 # Whether to attach the caller's photo and recorded utterance audio to each turn.
