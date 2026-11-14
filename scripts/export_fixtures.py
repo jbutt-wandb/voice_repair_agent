@@ -32,7 +32,7 @@ load_dotenv(ROOT / ".env")
 
 import weave
 
-from server.config import WANDB_ENTITY, WANDB_PROJECT
+from server.config import WEAVE_TARGET
 from server.session import _trim_leading_silence
 from server.weave_trace import _pcm16_to_wav
 
@@ -62,7 +62,7 @@ def fetch_turns(client, thread_id: str) -> list[tuple[str, bytes]]:
     """(user_text, wav_bytes) per voice_turn of the thread, oldest first.
     Turns without mic audio (typed / image-autosend) are skipped with a note."""
     calls = list(client.get_calls(
-        filter={"op_names": [f"weave:///{WANDB_ENTITY}/{WANDB_PROJECT}/op/voice_turn:*"]},
+        filter={"op_names": [f"weave:///{client.entity}/{client.project}/op/voice_turn:*"]},
         sort_by=[{"field": "started_at", "direction": "desc"}], limit=2000))
     picked = sorted((c for c in calls if c.thread_id == thread_id),
                     key=lambda c: c.started_at)
@@ -123,6 +123,6 @@ def export(name: str, spec: dict, client) -> None:
 
 
 if __name__ == "__main__":
-    client = weave.init(f"{WANDB_ENTITY}/{WANDB_PROJECT}")
+    client = weave.init(WEAVE_TARGET)
     for name, spec in SCENARIOS.items():
         export(name, spec, client)

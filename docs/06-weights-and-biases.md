@@ -87,8 +87,8 @@ All in `server/config.py`, env-overridable (booleans accept `0`/`false`/`no`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WANDB_ENTITY` | `wandb-smle` | W&B entity (team) the traces ship to |
-| `WANDB_PROJECT` | `jb_voice_deepgram_agent` | W&B project the traces ship to |
+| `WANDB_ENTITY` | *(empty — your default entity)* | W&B entity (team) the traces ship to |
+| `WANDB_PROJECT` | `voice-repair-agent` | W&B project the traces ship to (auto-created) |
 | `WEAVE_ENABLED` | `1` | master switch for tracing |
 | `WEAVE_CAPTURE_MEDIA` | `1` | attach photo + both audio streams to each turn |
 | `AGENT_LENS_ENABLED` | `1` | emit each turn to the Agents view (Agent Lens) |

@@ -77,7 +77,7 @@ The tunables (booleans accept `0`/`false`/`no` as off):
 | Images | `IMAGE_AUTOSEND_S` | `2.0` | a lone photo (no speech) auto-starts a turn after this many seconds |
 | Idle timeout | `IDLE_PROMPT_S` / `IDLE_HANGUP_S` | `15` / `25` | silence before the nudge, then the goodbye |
 | Weave | `WEAVE_ENABLED` / `WEAVE_CAPTURE_MEDIA` | `1` / `1` | tracing master switch; attach audio/photos to turns |
-| Weave | `WANDB_ENTITY` / `WANDB_PROJECT` | `wandb-smle` / `jb_voice_deepgram_agent` | where traces ship |
+| Weave | `WANDB_ENTITY` / `WANDB_PROJECT` | *(your default entity)* / `voice-repair-agent` | where traces ship; set both to target a team project |
 | Vocal judge | `VOCAL_JUDGE_ENABLED` / `VOCAL_JUDGE_MODEL` | `1` / `gpt-audio-mini` | per-turn acoustic frustration/fear verdict |
 | Agent Lens | `AGENT_LENS_ENABLED` | `1` | emit each turn to the Forge Agents view |
 | Agent Lens | `AGENT_NAME` / `AGENT_VERSION` | `repair-agent` / `dev` | the agent entity + version label |
