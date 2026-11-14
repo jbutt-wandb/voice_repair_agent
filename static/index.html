@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Voice Repair Agent — Deepgram STT → LLM → TTS</title>
+  <title>HomeFix Appliances — Deepgram STT → LLM → TTS</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header>
     <div class="title">
-      <h1>Voice Repair Agent</h1>
+      <h1>HomeFix Appliances</h1>
       <span class="subtitle">Deepgram STT &rarr; OpenAI &rarr; Deepgram TTS, one WebSocket</span>
     </div>
     <div class="controls">
@@ -22,7 +22,14 @@
 
   <main>
     <section id="conversation-panel">
-      <div id="transcript"></div>
+      <div id="transcript">
+        <div id="transcript-hint">
+          <h2>Try it</h2>
+          <p>“My washing machine won’t drain” &rarr; safe fix.<br>
+             “My ice maker isn’t cooling” &rarr; engineer booking.<br>
+             Talk over the agent to barge in. Use headphones.</p>
+        </div>
+      </div>
       <form id="text-form" autocomplete="off">
         <input id="text-input" type="text"
                placeholder="Type instead of speaking (bypasses STT — for testing)">
@@ -33,8 +40,8 @@
     <aside id="side-panel">
       
 
-      <div class="card">
-        <h2>Per-turn latency (ms)</h2>
+      <details class="card">
+        <summary>Per-turn latency (ms)</summary>
         <table id="metrics-table">
           <thead>
             <tr>
@@ -52,14 +59,7 @@
             <tr id="metrics-avg"><td>avg</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td><td></td></tr>
           </tfoot>
         </table>
-      </div>
-
-      <div class="card hint">
-        <h2>Try it</h2>
-        <p>“My washing machine won’t drain” &rarr; safe fix.<br>
-           “My ice maker isn’t cooling” &rarr; engineer booking.<br>
-           Talk over the agent to barge in. Use headphones.</p>
-      </div>
+      </details>
     </aside>
   </main>
 
