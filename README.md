@@ -17,11 +17,13 @@ Prerequisites: [uv](https://docs.astral.sh/uv/) and Chrome. Python 3.14 is pinne
 git clone <this-repo> && cd voice_repair_agent
 ```
 
-Create a `.env` in the project root with two required keys:
+Copy the template and fill in the two required keys (the server refuses to start
+without them, with a clear error):
 
 ```bash
-DEEPGRAM_API_KEY=...   # create one at https://console.deepgram.com/
-OPENAI_API_KEY=...     # create one at https://platform.openai.com/api-keys
+cp .env.example .env
+# DEEPGRAM_API_KEY  — create one at https://console.deepgram.com/
+# OPENAI_API_KEY    — create one at https://platform.openai.com/api-keys
 ```
 
 Then run it:
@@ -62,8 +64,12 @@ pieces link together in diagrams. The full explainer series lives in
 ## Configuration
 
 Every knob lives in [`server/config.py`](server/config.py) with the tradeoff it
-controls commented beside it. The ones you'd actually toggle (all env vars; booleans
-accept `0`/`false`/`no` as off):
+controls commented beside it, in three deliberate tiers: **secrets** (`.env` only —
+see `.env.example`), **deploy tunables** (the env vars below), and **product
+decisions** (plain constants you edit in the file). At startup the server fails fast
+with a fix-it message if a required key is missing, and logs one `config:` line
+showing the live values — so "which knobs are on?" never requires reading code.
+The tunables (booleans accept `0`/`false`/`no` as off):
 
 | Area | Variable | Default | Meaning |
 |---|---|---|---|

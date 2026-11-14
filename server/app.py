@@ -12,6 +12,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 
+from .config import check_required_keys, effective_config_line
 from .session import Session
 from .weave_trace import init_weave
 
@@ -21,7 +22,12 @@ log = logging.getLogger("app")
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
-app = FastAPI(title="Voice Repair Agent")
+# Die at boot — with a fix-it message — rather than mid-call if .env is incomplete,
+# then log the live config so "which knobs are on?" never requires reading code.
+check_required_keys()
+log.info("config: %s", effective_config_line())
+
+app = FastAPI(title="HomeFix Appliances voice agent")
 
 # Initialise Weave tracing once for the whole process (no-op without WANDB_API_KEY).
 init_weave()
