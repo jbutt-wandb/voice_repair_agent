@@ -30,7 +30,7 @@ network flushing off the hot path.
 | `turn_id` | `session.py::_start_turn` → `weave_trace.py::SessionTracer.start_turn` | keys the span to the session's turn counter, matching the per-turn log lines |
 | `user_text` | `SessionTracer.start_turn` | the finalized transcript (or typed text) that drove the turn |
 | `image` | `TurnTrace.set_image` (raw data URL), decoded in `SessionTracer._decode_image` at finish | the customer's photo; decode deferred to the turn boundary so it never costs latency |
-| `user_audio` | `TurnTrace.set_audio`, wrapped by `weave_trace.py::_pcm16_to_wav` as `weave.Audio` | caller mic for this turn, 16 kHz — you cannot debug a voice agent from text alone |
+| `user_audio` | `TurnTrace.set_audio`, wrapped by `weave_trace.py::_pcm16_to_wav` as `weave.Audio` | caller mic for this turn, 16 kHz — you cannot debug a voice agent from text alone. Leading silence is trimmed at snapshot (`session.py::_trim_leading_silence`): the mic rolls continuously between turns (barge-in needs it), so the raw window is mostly the agent's own reply + thinking pause. The voiced threshold scales with the clip's own peak (`max(500, peak/6)`) because a fixed floor was defeated by the ~1-2k boundary blip of the agent's audio tail; 1 s pre-roll is kept so barge-in context survives and speech can't be clipped |
 | `tts_audio` | `session.py::_finish_agent_turn` (`tt.set_tts_audio`) | the agent's spoken reply, 24 kHz. The two streams stay SEPARATE (never spliced) so each side can be scrubbed on its own in the UI — and they differ in sample rate anyway (16 vs 24 kHz) |
 
 ### Output

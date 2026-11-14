@@ -70,7 +70,12 @@ gen_ai.conversation.id`. Where to look:
   inline); **Play all** replays the entire call.
 - **Spans** — the per-turn `chat`/STT/TTS/`execute_tool` waterfall, with the app's
   custom `app.*` attributes (latencies, barge-in, vocal flags) as filterable columns.
-- **Signals** — monitors score the emitted turns (`weave.genai.turn_ended`).
+- **Signals** — monitors score the emitted turns (`weave.genai.turn_ended`). A merged
+  preset signal (User Frustration + Jailbreaking + NSFW, 100% sampling) mirrors the
+  transcript monitor. *Status note (Nov 2026):* it is created and active but the
+  deployment's scoring worker currently rejects the agent-turn op ref ("Incorrect op
+  ref") and scores nothing — a platform bug, reported; turn-level scoring keeps
+  working via the calls-store monitor meanwhile.
 
 The field-level detail — every field, where it's set, and why it's shaped that way,
 for both stores — lives in [doc 07](07-trace-shaping.md).
