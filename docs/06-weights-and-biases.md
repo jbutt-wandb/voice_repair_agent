@@ -72,10 +72,11 @@ gen_ai.conversation.id`. Where to look:
   custom `app.*` attributes (latencies, barge-in, vocal flags) as filterable columns.
 - **Signals** — monitors score the emitted turns (`weave.genai.turn_ended`). A merged
   preset signal (User Frustration + Jailbreaking + NSFW, 100% sampling) mirrors the
-  transcript monitor. *Status note (Nov 2026):* it is created and active but the
-  deployment's scoring worker currently rejects the agent-turn op ref ("Incorrect op
-  ref") and scores nothing — a platform bug, reported; turn-level scoring keeps
-  working via the calls-store monitor meanwhile.
+  transcript monitor and is verified working: replayed frustrated/jailbreak turns get
+  tagged with quoted reasons. Two things that *mimic* a dead signal: tag-type signals
+  emit only MATCHING tags (benign turns produce no feed entries — an empty feed is
+  not a failure), and the Monitors table renders the agent-op literal as "Incorrect
+  op ref", which is cosmetic.
 
 The field-level detail — every field, where it's set, and why it's shaped that way,
 for both stores — lives in [doc 07](07-trace-shaping.md).
