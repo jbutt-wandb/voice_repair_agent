@@ -37,6 +37,7 @@ BROWSER <-> SERVER PROTOCOL (one WebSocket)
 from __future__ import annotations
 
 import asyncio
+import array
 import contextlib
 import datetime
 import enum
@@ -78,6 +79,28 @@ def _p95(values: list[float]) -> float:
     ordered = sorted(values)
     rank = max(1, -(-len(ordered) * 95 // 100))  # ceil(0.95*n)
     return ordered[rank - 1]
+
+
+# Leading-silence trim for the per-turn mic snapshot (observability only — the live
+# STT stream is never touched). The mic rolls continuously between turn boundaries,
+# so an untrimmed clip is mostly the agent's own reply playing out (near-silence
+# after browser echo cancellation) plus the caller's thinking pause.
+_TRIM_FRAME_SAMPLES = 320            # 20 ms frames at 16 kHz
+_TRIM_THRESHOLD = 500                # int16 peak ~1.5% full scale; AEC residual sits far below
+_TRIM_PREROLL_BYTES = 16000 * 2      # keep 1 s before the first voiced frame: barge-in
+                                     # context survives and a late threshold can't clip speech
+
+
+def _trim_leading_silence(pcm: bytes) -> bytes:
+    """Drop near-silence before the caller's first voiced 20 ms frame, keeping a 1 s
+    pre-roll. If no frame crosses the threshold, return everything rather than guess."""
+    samples = array.array("h", pcm[: len(pcm) // 2 * 2])
+    for i in range(0, len(samples), _TRIM_FRAME_SAMPLES):
+        frame = samples[i:i + _TRIM_FRAME_SAMPLES]
+        if frame and max(max(frame), -min(frame)) >= _TRIM_THRESHOLD:
+            return pcm[max(0, i * 2 - _TRIM_PREROLL_BYTES):]
+    return pcm
+
 
 GREETING = ("Hi, you're through to HomeFix Appliances repair support, this is Alex. "
             "Which appliance can I help you with today?")
@@ -823,10 +846,14 @@ class Session:
     def _snapshot_mic(self) -> bytes | None:
         """Return (and clear) the mic PCM buffered for the turn just ended. Always
         clears so the buffer can't grow without bound; returns None when empty or
-        when media capture is off."""
+        when media capture is off. Leading silence is trimmed (keeping a 1s
+        pre-roll) — the buffer rolls from the PREVIOUS turn boundary, so untrimmed
+        it spans the agent's whole reply + the caller's thinking pause before any
+        speech. This snapshot is observability-only (trace, Agent Lens, vocal
+        judge all consume it); the live STT stream is untouched."""
         if not self._mic_buf:
             return None
-        data = bytes(self._mic_buf)
+        data = _trim_leading_silence(bytes(self._mic_buf))
         self._mic_buf.clear()
         return data if self.trace.capture_media else None
 
