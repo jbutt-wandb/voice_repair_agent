@@ -75,6 +75,7 @@ def load_scenario(name: str) -> list[dict]:
             # Encode exactly as the browser does (static/app.js): a base64 data URL.
             mime = mimetypes.guess_type(ev["file"])[0] or "image/jpeg"
             events.append({"type": "image", "label": ev["file"],
+                           "autosend": bool(ev.get("autosend")),
                            "data_url": f"data:{mime};base64,{base64.b64encode(blob).decode()}"})
         else:
             raise SystemExit(f"unknown event type {ev['type']!r} in {manifest_path}")
@@ -153,10 +154,11 @@ async def replay(items: list[dict]) -> None:
                 await ws.send(json.dumps({"type": "image", "data": item["data_url"]}))
                 print(f"  image {item['label']} sent", end="", flush=True)
                 nxt = items[n + 1] if n + 1 < len(items) else None
-                if nxt is None or nxt["type"] == "image":
-                    # No speech rides with this photo: the server auto-sends a lone
-                    # image after IMAGE_AUTOSEND_S (2 s) of silence — wait that out,
-                    # then wait for the agent's reply to finish.
+                if item.get("autosend") or nxt is None or nxt["type"] == "image":
+                    # No speech rides with this photo ("autosend": true in the
+                    # manifest, or nothing speakable follows): the server auto-sends
+                    # a lone image after IMAGE_AUTOSEND_S (2 s) of silence — wait
+                    # that out, then wait for the agent's reply to finish.
                     print(" ... waiting for image auto-send turn", end="", flush=True)
                     await asyncio.sleep(3.5)
                     ev = await pump_until(turn_over)
