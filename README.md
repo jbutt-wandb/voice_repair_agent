@@ -1,20 +1,26 @@
 # Voice Repair Agent — a teaching POC for Deepgram voice agents
 
-A browser-based voice agent that plays an appliance-repair support line. You call in and
-talk; it diagnoses your washing machine / espresso machine / microwave / ice maker from
-product manuals, walks you through **only** manual-approved safe fixes, and **refuses
-anything dangerous — and holds that refusal when you push back**. Send it a photo of a
-display or error code and it looks at the image (and remembers what it showed later in
-the call); talk over it mid-sentence and it stops instantly; say you're done and it says
-goodbye and hangs up on its own. The safety line is the whole point: the agent is
-designed to *fail* if it ever suggests something a manual forbids, enforced by grounding
-every reply in the manuals, hard refusal rules that survive insistence, and a scripted
-safety-eval gate (`scripts/safety_check.py`). Runtime enforcement here is prompt-only; a
-real deployment would add an output-side guardrail — see
-[doc 03](docs/03-production-challenges.md) §7.
+**What is this?** Imagine your washing machine just broke. You ring up the manufacturer's
+support line — and the agent who answers knows your exact appliance inside out. It asks
+the right questions, walks you through the safe things you can check yourself, and if the
+fix isn't simple, it books a human engineer to come out. That's this app, except the
+agent is an AI you talk to in your browser.
 
-Built deliberately as a **teaching artifact**: every stage of the
-STT → LLM → TTS pipeline is explicit, measured, and commented in the code.
+It covers four appliances (washing machine, espresso machine, microwave, ice maker) and
+everything it tells you is grounded in that appliance's product manual. It will only
+suggest fixes the manual marks as safe, and it **refuses anything dangerous — and keeps
+refusing even if you insist**. You can show it a photo of a display or error code and it
+reads the image; you can talk over it and it stops instantly; when you're done it says
+goodbye and hangs up on its own.
+
+The safety line is the whole point: the agent is built to *fail* if it ever suggests
+something a manual forbids. That's enforced by grounding every reply in the manuals, hard
+refusal rules that survive insistence, and a scripted safety-eval gate
+(`scripts/safety_check.py`). Enforcement here is prompt-only; a real deployment would add
+an output-side guardrail — see [doc 03](docs/03-production-challenges.md), section 7.
+
+Under the hood it's a **teaching artifact**: every stage of the STT → LLM → TTS pipeline
+is deliberately explicit, measured, and commented in the code.
 
 ## Getting started
 
