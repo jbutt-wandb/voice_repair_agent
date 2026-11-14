@@ -86,18 +86,28 @@ def _p95(values: list[float]) -> float:
 # so an untrimmed clip is mostly the agent's own reply playing out (near-silence
 # after browser echo cancellation) plus the caller's thinking pause.
 _TRIM_FRAME_SAMPLES = 320            # 20 ms frames at 16 kHz
-_TRIM_THRESHOLD = 500                # int16 peak ~1.5% full scale; AEC residual sits far below
+_TRIM_THRESHOLD = 500                # int16 peak floor ~1.5% full scale
+_TRIM_PEAK_DIVISOR = 6               # ...raised to clip_peak/6: live-call boundary blips
+                                     # (the agent's own audio tail / echo ramp, measured
+                                     # peaks ~1-2k) sit far below real speech (9-32k), so
+                                     # the speech threshold must scale with THIS clip
 _TRIM_PREROLL_BYTES = 16000 * 2      # keep 1 s before the first voiced frame: barge-in
                                      # context survives and a late threshold can't clip speech
 
 
 def _trim_leading_silence(pcm: bytes) -> bytes:
-    """Drop near-silence before the caller's first voiced 20 ms frame, keeping a 1 s
-    pre-roll. If no frame crosses the threshold, return everything rather than guess."""
+    """Drop everything before the caller's first genuinely-voiced 20 ms frame,
+    keeping a 1 s pre-roll. "Voiced" is relative to the clip's own loudness
+    (max of a fixed floor and clip_peak/6), so a short boundary blip at second
+    zero can't defeat the trim. If nothing qualifies, return the clip untouched."""
     samples = array.array("h", pcm[: len(pcm) // 2 * 2])
+    if not samples:
+        return pcm
+    clip_peak = max(max(samples), -min(samples))
+    threshold = max(_TRIM_THRESHOLD, clip_peak // _TRIM_PEAK_DIVISOR)
     for i in range(0, len(samples), _TRIM_FRAME_SAMPLES):
         frame = samples[i:i + _TRIM_FRAME_SAMPLES]
-        if frame and max(max(frame), -min(frame)) >= _TRIM_THRESHOLD:
+        if frame and max(max(frame), -min(frame)) >= threshold:
             return pcm[max(0, i * 2 - _TRIM_PREROLL_BYTES):]
     return pcm
 
