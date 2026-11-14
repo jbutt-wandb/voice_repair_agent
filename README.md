@@ -55,6 +55,8 @@ Verification gates and smoke tests:
 ```bash
 uv run scripts/safety_check.py   # the safety evaluation gate (see below)
 uv run scripts/e2e_check.py      # full-pipeline check over the real WebSocket (server must be up)
+uv run scripts/replay_session.py --scenario happy_path   # replay a canned call (audio + photo)
+uv run scripts/replay_session.py --scenario frustrated   # replay the frustration/jailbreak call
 uv run python -m server.tts      # standalone TTS smoke test
 uv run python -m server.stt      # standalone STT smoke test (loops TTS audio into STT)
 ```
